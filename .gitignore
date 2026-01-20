@@ -1,0 +1,4 @@
+# Node tree-elements are synced from server
+node/src/tree-elements/elements/
+node/src/tree-elements/plugins/
+node/src/tree-elements/remote/

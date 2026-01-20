@@ -1,0 +1,137 @@
+import { Router } from "express";
+import { nanoid } from "nanoid";
+import { scanLibrary, startLibraryScan } from "../services/scanner.js";
+import { watchLibrary } from "../services/watcher.js";
+
+export function createLibrariesRouter(db, watchers, scanTimers) {
+  const router = Router();
+
+  router.get("/", (req, res) => {
+    const libraries = db
+      .prepare(
+        `SELECT l.*, 
+          (SELECT COUNT(*) FROM files f WHERE f.library_id = l.id) AS file_count
+         FROM libraries l
+         ORDER BY l.created_at DESC`
+      )
+      .all();
+    res.json(libraries);
+  });
+
+  router.get("/:id/files", (req, res) => {
+    const { id } = req.params;
+    const limit = Math.min(Number(req.query.limit ?? 25), 200);
+    const offset = Number(req.query.offset ?? 0);
+
+    const totalRow = db
+      .prepare("SELECT COUNT(*) AS count FROM files WHERE library_id = ?")
+      .get(id);
+    const files = db
+      .prepare(
+        "SELECT * FROM files WHERE library_id = ? ORDER BY updated_at DESC LIMIT ? OFFSET ?"
+      )
+      .all(id, limit, offset);
+
+    res.json({ total: totalRow?.count ?? 0, files });
+  });
+
+  router.get("/:id/tree", (req, res) => {
+    const { id } = req.params;
+    const mapping = db
+      .prepare(
+        "SELECT m.tree_id, m.tree_version, t.name AS tree_name FROM library_tree_map m JOIN trees t ON t.id = m.tree_id WHERE m.library_id = ?"
+      )
+      .get(id);
+
+    if (!mapping) return res.json({ tree_id: null, tree_version: null });
+
+    const version = db
+      .prepare(
+        "SELECT graph_json FROM tree_versions WHERE tree_id = ? AND version = ?"
+      )
+      .get(mapping.tree_id, mapping.tree_version);
+
+    res.json({
+      tree_id: mapping.tree_id,
+      tree_version: mapping.tree_version,
+      tree_name: mapping.tree_name,
+      graph: version?.graph_json ?? null,
+    });
+  });
+
+  router.put("/:id/tree", (req, res) => {
+    const { id } = req.params;
+    const { treeId, treeVersion } = req.body;
+    if (!treeId || !treeVersion) {
+      return res.status(400).json({ error: "treeId and treeVersion required" });
+    }
+
+    const tree = db.prepare("SELECT id FROM trees WHERE id = ?").get(treeId);
+    if (!tree) return res.status(404).json({ error: "tree not found" });
+
+    const version = db
+      .prepare("SELECT id FROM tree_versions WHERE tree_id = ? AND version = ?")
+      .get(treeId, Number(treeVersion));
+    if (!version) return res.status(404).json({ error: "tree version not found" });
+
+    db.prepare(
+      "INSERT INTO library_tree_map (library_id, tree_id, tree_version) VALUES (?, ?, ?) ON CONFLICT(library_id) DO UPDATE SET tree_id = excluded.tree_id, tree_version = excluded.tree_version"
+    ).run(id, treeId, Number(treeVersion));
+
+    res.json({ ok: true });
+  });
+
+  router.post("/", async (req, res) => {
+    const { name, path, includeExtensions, excludeExtensions, nodes, scanIntervalMin } = req.body;
+    if (!name || !path) return res.status(400).json({ error: "name and path required" });
+
+    const now = new Date().toISOString();
+    const id = nanoid();
+
+    const include_exts = includeExtensions ? JSON.stringify(includeExtensions) : null;
+    const exclude_exts = excludeExtensions ? JSON.stringify(excludeExtensions) : null;
+    const nodes_json = nodes ? JSON.stringify(nodes) : null;
+    const scan_interval_min = scanIntervalMin ? Number(scanIntervalMin) : null;
+
+    db.prepare(
+      "INSERT INTO libraries (id, name, path, created_at, include_exts, exclude_exts, nodes_json, scan_interval_min) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+    ).run(id, name, path, now, include_exts, exclude_exts, nodes_json, scan_interval_min);
+
+    const library = {
+      id,
+      name,
+      path,
+      created_at: now,
+      include_exts,
+      exclude_exts,
+      nodes_json,
+      scan_interval_min,
+    };
+    await scanLibrary(db, library);
+    watchers.set(id, watchLibrary(db, library));
+    scanTimers.set(id, startLibraryScan(db, library));
+
+    res.json(library);
+  });
+
+  router.put("/:id", async (req, res) => {
+    const { id } = req.params;
+    const { name, path, includeExtensions, excludeExtensions, nodes, scanIntervalMin } = req.body;
+
+    const include_exts = includeExtensions ? JSON.stringify(includeExtensions) : null;
+    const exclude_exts = excludeExtensions ? JSON.stringify(excludeExtensions) : null;
+    const nodes_json = nodes ? JSON.stringify(nodes) : null;
+    const scan_interval_min = scanIntervalMin ? Number(scanIntervalMin) : null;
+
+    db.prepare(
+      `UPDATE libraries
+       SET name = ?, path = ?, include_exts = ?, exclude_exts = ?, nodes_json = ?, scan_interval_min = ?
+       WHERE id = ?`
+    ).run(name, path, include_exts, exclude_exts, nodes_json, scan_interval_min, id);
+
+    const library = db.prepare("SELECT * FROM libraries WHERE id = ?").get(id);
+    res.json(library);
+  });
+
+  return router;
+}

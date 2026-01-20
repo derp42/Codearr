@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Codarr</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <link rel="stylesheet" href="https://unpkg.com/reactflow@11.11.3/dist/style.css" />
+  </head>
+  <body>
+    <div id="app">
+      <aside class="sidebar">
+        <div class="logo">Codarr</div>
+        <nav class="nav">
+          <button class="nav-item" data-view="dashboard">Dashboard</button>
+
+          <button class="nav-item" data-view="libraries" data-expandable="true">
+            <span class="nav-label">Libraries</span>
+            <span class="nav-caret" data-nav-toggle="libraries">▾</span>
+          </button>
+          <div class="subnav" data-subnav="libraries"></div>
+
+          <button class="nav-item" data-view="nodes" data-expandable="true">
+            <span class="nav-label">Nodes</span>
+            <span class="nav-caret" data-nav-toggle="nodes">▾</span>
+          </button>
+          <div class="subnav" data-subnav="nodes"></div>
+
+          <button class="nav-item" data-view="jobs" data-expandable="true">
+            <span class="nav-label">Jobs</span>
+            <span class="nav-caret" data-nav-toggle="jobs">▾</span>
+          </button>
+          <div class="subnav" data-subnav="jobs"></div>
+
+          <button class="nav-item" data-view="trees" data-expandable="true">
+            <span class="nav-label">Trees</span>
+            <span class="nav-caret" data-nav-toggle="trees">▾</span>
+          </button>
+          <div class="subnav" data-subnav="trees"></div>
+        </nav>
+      </aside>
+      <main class="content">
+        <header class="header">
+          <h1 id="view-title">Dashboard</h1>
+          <div class="status" id="server-status">Checking server...</div>
+        </header>
+        <section id="view"></section>
+      </main>
+    </div>
+    <script src="https://unpkg.com/react@18.2.0/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18.2.0/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/reactflow@11.11.3/dist/umd/index.js"></script>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
