@@ -62,8 +62,27 @@ const envIntelXpuSmiPath = readEnv(process.env.CODARR_INTEL_XPU_SMI_PATH) ?? "";
 const envRadeontopPath = readEnv(process.env.CODARR_RADEONTOP_PATH) ?? "";
 const envAmdSmiPath = readEnv(process.env.CODARR_AMD_SMI_PATH) ?? "";
 const envJobSlotsCpu = readEnv(process.env.CODARR_JOB_SLOTS_CPU) ?? "1";
-const envJobSlotsGpu = readEnv(process.env.CODARR_JOB_SLOTS_GPU) ?? "0";
-const envEnableJobs = readEnv(process.env.CODARR_ENABLE_JOBS) ?? "false";
+const envJobSlotsGpu = readEnv(process.env.CODARR_JOB_SLOTS_GPU) ?? "1";
+const envEnableJobs = readEnv(process.env.CODARR_ENABLE_JOBS) ?? "true";
+const envEnableTranscode = readEnv(process.env.CODARR_ENABLE_TRANSCODE) ?? "true";
+const envHealthcheckSlotsCpu = readEnv(process.env.CODARR_HEALTHCHECK_SLOTS_CPU) ?? "1";
+const envHealthcheckSlotsGpu = readEnv(process.env.CODARR_HEALTHCHECK_SLOTS_GPU) ?? "0";
+const envTranscodeSlotsCpu = readEnv(process.env.CODARR_TRANSCODE_SLOTS_CPU) ?? "1";
+const envTranscodeSlotsGpu = readEnv(process.env.CODARR_TRANSCODE_SLOTS_GPU) ?? "1";
+const envTargetHealthcheckCpu = readEnv(process.env.CODARR_TARGET_HEALTHCHECK_CPU) ?? "-1";
+const envTargetHealthcheckGpu = readEnv(process.env.CODARR_TARGET_HEALTHCHECK_GPU) ?? "-1";
+const envTargetTranscodeCpu = readEnv(process.env.CODARR_TARGET_TRANSCODE_CPU) ?? "-1";
+const envTargetTranscodeGpu = readEnv(process.env.CODARR_TARGET_TRANSCODE_GPU) ?? "-1";
+const envJobStartCooldownMs = readEnv(process.env.CODARR_JOB_START_COOLDOWN_MS) ?? "60000";
+const envHealthcheckArgsAny = readEnv(process.env.CODARR_HEALTHCHECK_ARGS_ANY) ?? "-v error -stats -stats_period 2";
+const envHealthcheckArgsNvenc = readEnv(process.env.CODARR_HEALTHCHECK_ARGS_NVENC) ?? "-v error -stats -stats_period 2 -hwaccel nvdec -hwaccel_output_format cuda";
+const envHealthcheckArgsVaapi = readEnv(process.env.CODARR_HEALTHCHECK_ARGS_VAAPI) ?? "-v error -stats -stats_period 2 -hwaccel vaapi -hwaccel_output_format vaapi";
+const envHealthcheckArgsQsv = readEnv(process.env.CODARR_HEALTHCHECK_ARGS_QSV) ?? "-v error -stats -stats_period 2 -hwaccel vaapi -hwaccel_output_format vaapi";
+const envHealthcheckGpuTargets = readEnv(process.env.CODARR_HEALTHCHECK_GPU_TARGETS) ?? "";
+const envHealthcheckGpuSlots = readEnv(process.env.CODARR_HEALTHCHECK_GPU_SLOTS) ?? "";
+const envTranscodeGpuTargets = readEnv(process.env.CODARR_TRANSCODE_GPU_TARGETS) ?? "";
+const envTranscodeGpuSlots = readEnv(process.env.CODARR_TRANSCODE_GPU_SLOTS) ?? "";
+const envNodeTags = readEnv(process.env.CODARR_NODE_TAGS) ?? "";
 
 const isWindows = process.platform === "win32";
 
@@ -185,6 +204,9 @@ export const config = {
   serverUrl,
   nodeName,
   nodeId,
+  nodeTags: envNodeTags
+    ? envNodeTags.split(/[\,\s]+/).map((tag) => tag.trim()).filter(Boolean)
+    : [],
   ffmpegPath,
   ffprobePath,
   handbrakeCliPath,
@@ -196,6 +218,24 @@ export const config = {
   jobSlotsCpu: Number(envJobSlotsCpu ?? 1),
   jobSlotsGpu: Number(envJobSlotsGpu ?? 0),
   enableJobs: envEnableJobs.toLowerCase() === "true",
+  enableTranscode: envEnableTranscode.toLowerCase() === "true",
+  healthcheckSlotsCpu: Number(envHealthcheckSlotsCpu ?? 1),
+  healthcheckSlotsGpu: Number(envHealthcheckSlotsGpu ?? 0),
+  transcodeSlotsCpu: Number(envTranscodeSlotsCpu ?? 0),
+  transcodeSlotsGpu: Number(envTranscodeSlotsGpu ?? 0),
+  targetHealthcheckCpu: Number(envTargetHealthcheckCpu ?? -1),
+  targetHealthcheckGpu: Number(envTargetHealthcheckGpu ?? -1),
+  targetTranscodeCpu: Number(envTargetTranscodeCpu ?? -1),
+  targetTranscodeGpu: Number(envTargetTranscodeGpu ?? -1),
+  jobStartCooldownMs: Number(envJobStartCooldownMs ?? 60000),
+  healthcheckArgsAny: envHealthcheckArgsAny,
+  healthcheckArgsNvenc: envHealthcheckArgsNvenc,
+  healthcheckArgsVaapi: envHealthcheckArgsVaapi,
+  healthcheckArgsQsv: envHealthcheckArgsQsv,
+  healthcheckGpuTargets: envHealthcheckGpuTargets,
+  healthcheckGpuSlots: envHealthcheckGpuSlots,
+  transcodeGpuTargets: envTranscodeGpuTargets,
+  transcodeGpuSlots: envTranscodeGpuSlots,
 };
 
 function commonToolPaths(commandNames) {

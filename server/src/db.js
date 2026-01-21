@@ -1,4 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
+import { randomUUID } from "node:crypto";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -40,19 +41,37 @@ class SqliteAdapter {
   }
 }
 
-export function initDb() {
+export async function initDb({ retries = 5, retryDelayMs = 5000 } = {}) {
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    try {
+      return initDbOnce();
+    } catch (error) {
+      if (!isDiskIoError(error) || attempt >= retries) {
+        throw error;
+      }
+      const remaining = retries - attempt;
+      console.warn(`SQLite disk I/O error. Retrying in ${retryDelayMs}ms (${remaining} retries left)...`);
+      await sleep(retryDelayMs);
+    }
+  }
+  throw new Error("Failed to initialize database after retries");
+}
+
+function initDbOnce() {
   let adapter = openDatabaseWithRecovery();
   try {
-    adapter.exec("PRAGMA journal_mode = WAL");
-  } catch (error) {
-    if (!isDiskIoError(error)) throw error;
-    console.warn("SQLite disk I/O error during PRAGMA. Retrying with recovery...");
-    cleanupWalFiles();
-    adapter = openDatabaseWithRecovery();
-    adapter.exec("PRAGMA journal_mode = WAL");
-  }
+    try {
+      adapter.exec("PRAGMA journal_mode = WAL");
+    } catch (error) {
+      if (!isDiskIoError(error)) throw error;
+      console.warn("SQLite disk I/O error during PRAGMA. Retrying with recovery...");
+      cleanupWalFiles();
+      adapter.close();
+      adapter = openDatabaseWithRecovery();
+      adapter.exec("PRAGMA journal_mode = WAL");
+    }
 
-  adapter.exec(`
+    adapter.exec(`
     CREATE TABLE IF NOT EXISTS libraries (
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
@@ -61,7 +80,8 @@ export function initDb() {
       include_exts TEXT,
       exclude_exts TEXT,
       nodes_json TEXT,
-      scan_interval_min INTEGER
+      scan_interval_min INTEGER,
+      tree_scope TEXT
     );
 
     CREATE TABLE IF NOT EXISTS files (
@@ -74,9 +94,17 @@ export function initDb() {
       initial_size INTEGER,
       initial_container TEXT,
       initial_codec TEXT,
+      initial_audio_codec TEXT,
+      initial_subtitles TEXT,
+      initial_duration_sec REAL,
+      initial_frame_count INTEGER,
       final_size INTEGER,
       final_container TEXT,
       final_codec TEXT,
+      final_audio_codec TEXT,
+      final_subtitles TEXT,
+      final_duration_sec REAL,
+      final_frame_count INTEGER,
       new_path TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
@@ -90,6 +118,7 @@ export function initDb() {
       status TEXT NOT NULL,
       assigned_node_id TEXT,
       progress REAL,
+      progress_message TEXT,
       processing_type TEXT,
       accelerator TEXT,
       transcode_payload TEXT,
@@ -103,6 +132,11 @@ export function initDb() {
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
       description TEXT,
+      required_accelerators TEXT,
+      required_processing TEXT,
+      required_tags_all TEXT,
+      required_tags_any TEXT,
+      required_tags_none TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
@@ -125,13 +159,24 @@ export function initDb() {
       FOREIGN KEY(tree_id) REFERENCES trees(id)
     );
 
+    CREATE TABLE IF NOT EXISTS library_tree_rules (
+      library_id TEXT NOT NULL,
+      tree_id TEXT NOT NULL,
+      tree_version INTEGER NOT NULL,
+      PRIMARY KEY(library_id, tree_id),
+      FOREIGN KEY(library_id) REFERENCES libraries(id),
+      FOREIGN KEY(tree_id) REFERENCES trees(id)
+    );
+
     CREATE TABLE IF NOT EXISTS nodes (
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
       platform TEXT NOT NULL,
       last_seen TEXT NOT NULL,
       metrics_json TEXT NOT NULL,
-      hardware_json TEXT
+      hardware_json TEXT,
+      settings_json TEXT,
+      tags_json TEXT
     );
   `);
 
@@ -139,6 +184,62 @@ export function initDb() {
     adapter.exec("ALTER TABLE nodes ADD COLUMN hardware_json TEXT");
   } catch {
     // Column already exists
+  }
+
+  try {
+    adapter.exec("ALTER TABLE nodes ADD COLUMN settings_json TEXT");
+  } catch {
+    // Column already exists
+  }
+
+  try {
+    adapter.exec("ALTER TABLE nodes ADD COLUMN tags_json TEXT");
+  } catch {
+    // Column already exists
+  }
+
+  try {
+    adapter.exec("ALTER TABLE libraries ADD COLUMN tree_scope TEXT");
+  } catch {
+    // Column already exists
+  }
+
+  try {
+    adapter.exec("ALTER TABLE trees ADD COLUMN required_accelerators TEXT");
+  } catch {
+    // Column already exists
+  }
+
+  try {
+    adapter.exec("ALTER TABLE trees ADD COLUMN required_processing TEXT");
+  } catch {
+    // Column already exists
+  }
+
+  try {
+    adapter.exec("ALTER TABLE trees ADD COLUMN required_tags_all TEXT");
+  } catch {
+    // Column already exists
+  }
+
+  try {
+    adapter.exec("ALTER TABLE trees ADD COLUMN required_tags_any TEXT");
+  } catch {
+    // Column already exists
+  }
+
+  try {
+    adapter.exec("ALTER TABLE trees ADD COLUMN required_tags_none TEXT");
+  } catch {
+    // Column already exists
+  }
+
+  try {
+    adapter.exec(
+      "INSERT OR IGNORE INTO library_tree_rules (library_id, tree_id, tree_version) SELECT library_id, tree_id, tree_version FROM library_tree_map"
+    );
+  } catch {
+    // ignore migration errors
   }
 
   try {
@@ -155,6 +256,30 @@ export function initDb() {
 
   try {
     adapter.exec("ALTER TABLE files ADD COLUMN initial_codec TEXT");
+  } catch {
+    // Column already exists
+  }
+
+  try {
+    adapter.exec("ALTER TABLE files ADD COLUMN initial_audio_codec TEXT");
+  } catch {
+    // Column already exists
+  }
+
+  try {
+    adapter.exec("ALTER TABLE files ADD COLUMN initial_subtitles TEXT");
+  } catch {
+    // Column already exists
+  }
+
+  try {
+    adapter.exec("ALTER TABLE files ADD COLUMN initial_duration_sec REAL");
+  } catch {
+    // Column already exists
+  }
+
+  try {
+    adapter.exec("ALTER TABLE files ADD COLUMN initial_frame_count INTEGER");
   } catch {
     // Column already exists
   }
@@ -178,6 +303,30 @@ export function initDb() {
   }
 
   try {
+    adapter.exec("ALTER TABLE files ADD COLUMN final_audio_codec TEXT");
+  } catch {
+    // Column already exists
+  }
+
+  try {
+    adapter.exec("ALTER TABLE files ADD COLUMN final_subtitles TEXT");
+  } catch {
+    // Column already exists
+  }
+
+  try {
+    adapter.exec("ALTER TABLE files ADD COLUMN final_duration_sec REAL");
+  } catch {
+    // Column already exists
+  }
+
+  try {
+    adapter.exec("ALTER TABLE files ADD COLUMN final_frame_count INTEGER");
+  } catch {
+    // Column already exists
+  }
+
+  try {
     adapter.exec("ALTER TABLE files ADD COLUMN new_path TEXT");
   } catch {
     // Column already exists
@@ -185,6 +334,12 @@ export function initDb() {
 
   try {
     adapter.exec("ALTER TABLE jobs ADD COLUMN progress REAL");
+  } catch {
+    // Column already exists
+  }
+
+  try {
+    adapter.exec("ALTER TABLE jobs ADD COLUMN progress_message TEXT");
   } catch {
     // Column already exists
   }
@@ -267,7 +422,21 @@ export function initDb() {
     // Column already exists
   }
 
-  return adapter;
+  runFfmpegOutputNameMigration(adapter);
+
+    return adapter;
+  } catch (error) {
+    try {
+      adapter.close();
+    } catch {
+      // ignore close errors
+    }
+    throw error;
+  }
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function openDatabaseWithRecovery() {
@@ -319,4 +488,118 @@ function isDiskIoError(error) {
     error?.code === "ERR_SQLITE_ERROR" ||
     String(error?.message ?? "").toLowerCase().includes("disk i/o error")
   );
+}
+
+function runFfmpegOutputNameMigration(adapter) {
+  const migrationId = "ffmpeg_output_name";
+  try {
+    adapter.exec(
+      "CREATE TABLE IF NOT EXISTS migrations (id TEXT PRIMARY KEY, applied_at TEXT NOT NULL)"
+    );
+  } catch {
+    return;
+  }
+
+  const existing = adapter
+    .prepare("SELECT id FROM migrations WHERE id = ?")
+    .get(migrationId);
+  if (existing) return;
+
+  let updated = 0;
+  const rows = adapter.prepare("SELECT id, graph_json FROM tree_versions").all();
+  rows.forEach((row) => {
+    const graph = safeJsonParse(row.graph_json);
+    if (!graph || typeof graph !== "object") return;
+    const nodes = Array.isArray(graph.nodes) ? graph.nodes : [];
+    const edges = Array.isArray(graph.edges) ? graph.edges : [];
+    const elementTypeById = new Map(
+      nodes.map((node) => [
+        node.id,
+        node?.data?.elementType ?? node?.elementType ?? node?.type,
+      ])
+    );
+
+    let changed = false;
+    nodes.forEach((node) => {
+      const elementType = node?.data?.elementType ?? node?.elementType ?? node?.type;
+      if (elementType !== "ffmpeg_execute") return;
+
+      const incoming = edges.filter((edge) => edge.target === node.id);
+      const hasOutputName = incoming.some(
+        (edge) => elementTypeById.get(edge.source) === "ffmpeg_output_name"
+      );
+      if (!hasOutputName) {
+        const config = node?.data?.config ?? {};
+        const template =
+          config.outputTemplate !== undefined
+            ? config.outputTemplate
+            : config.outputPath ?? "{input_filename}.transcoded.{container_extension}";
+
+        const outputNodeId = `ffmpeg-output-name-${randomUUID()}`;
+        const position = node?.position ?? { x: 0, y: 0 };
+        const outputNode = {
+          id: outputNodeId,
+          type: "treeNode",
+          position: { x: position.x, y: position.y - 80 },
+          data: {
+            label: "FFmpeg Output Name",
+            elementType: "ffmpeg_output_name",
+            outputs: [{ id: "out", label: "out" }],
+            config: { outputTemplate: template },
+            __nodeId: outputNodeId,
+          },
+        };
+        nodes.push(outputNode);
+        elementTypeById.set(outputNodeId, "ffmpeg_output_name");
+
+        incoming.forEach((edge) => {
+          edge.target = outputNodeId;
+          edge.targetHandle = edge.targetHandle ?? "in";
+        });
+
+        edges.push({
+          id: `edge-${randomUUID()}`,
+          source: outputNodeId,
+          sourceHandle: "out",
+          target: node.id,
+          targetHandle: "in",
+        });
+        changed = true;
+      }
+
+      if (node?.data?.config) {
+        const nextConfig = {};
+        if (node.data.config.injectStats !== undefined) {
+          nextConfig.injectStats = node.data.config.injectStats;
+        }
+        node.data.config = nextConfig;
+        changed = true;
+      }
+    });
+
+    if (!changed) return;
+    graph.nodes = nodes;
+    graph.edges = edges;
+    adapter
+      .prepare("UPDATE tree_versions SET graph_json = ? WHERE id = ?")
+      .run(JSON.stringify(graph), row.id);
+    updated += 1;
+  });
+
+  adapter
+    .prepare("INSERT INTO migrations (id, applied_at) VALUES (?, ?)")
+    .run(migrationId, new Date().toISOString());
+  if (updated) {
+    console.log(`Migration ${migrationId}: updated ${updated} tree version(s).`);
+  }
+}
+
+function safeJsonParse(value) {
+  if (!value) return null;
+  if (typeof value === "object") return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
 }

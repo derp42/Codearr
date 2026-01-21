@@ -1,7 +1,8 @@
 import { Router } from "express";
 import { nanoid } from "nanoid";
-import { scanLibrary, startLibraryScan } from "../services/scanner.js";
+import { pruneMissingLibraryFiles, scanLibrary, startLibraryScan } from "../services/scanner.js";
 import { watchLibrary } from "../services/watcher.js";
+import { pruneOrphanJobs } from "../services/queue.js";
 
 export function createLibrariesRouter(db, watchers, scanTimers) {
   const router = Router();
@@ -59,6 +60,18 @@ export function createLibrariesRouter(db, watchers, scanTimers) {
     });
   });
 
+  router.get("/:id/trees", (req, res) => {
+    const { id } = req.params;
+    const library = db.prepare("SELECT tree_scope FROM libraries WHERE id = ?").get(id);
+    if (!library) return res.status(404).json({ error: "library not found" });
+    const rows = db
+      .prepare(
+        "SELECT r.tree_id, r.tree_version, t.name AS tree_name FROM library_tree_rules r JOIN trees t ON t.id = r.tree_id WHERE r.library_id = ?"
+      )
+      .all(id);
+    res.json({ tree_scope: library.tree_scope ?? "selected", trees: rows });
+  });
+
   router.put("/:id/tree", (req, res) => {
     const { id } = req.params;
     const { treeId, treeVersion } = req.body;
@@ -82,7 +95,7 @@ export function createLibrariesRouter(db, watchers, scanTimers) {
   });
 
   router.post("/", async (req, res) => {
-    const { name, path, includeExtensions, excludeExtensions, nodes, scanIntervalMin } = req.body;
+    const { name, path, includeExtensions, excludeExtensions, nodes, scanIntervalMin, treeScope, allowedTrees } = req.body;
     if (!name || !path) return res.status(400).json({ error: "name and path required" });
 
     const now = new Date().toISOString();
@@ -92,10 +105,11 @@ export function createLibrariesRouter(db, watchers, scanTimers) {
     const exclude_exts = excludeExtensions ? JSON.stringify(excludeExtensions) : null;
     const nodes_json = nodes ? JSON.stringify(nodes) : null;
     const scan_interval_min = scanIntervalMin ? Number(scanIntervalMin) : null;
+    const tree_scope = treeScope ?? null;
 
     db.prepare(
-      "INSERT INTO libraries (id, name, path, created_at, include_exts, exclude_exts, nodes_json, scan_interval_min) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-    ).run(id, name, path, now, include_exts, exclude_exts, nodes_json, scan_interval_min);
+      "INSERT INTO libraries (id, name, path, created_at, include_exts, exclude_exts, nodes_json, scan_interval_min, tree_scope) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    ).run(id, name, path, now, include_exts, exclude_exts, nodes_json, scan_interval_min, tree_scope);
 
     const library = {
       id,
@@ -106,7 +120,9 @@ export function createLibrariesRouter(db, watchers, scanTimers) {
       exclude_exts,
       nodes_json,
       scan_interval_min,
+      tree_scope,
     };
+    updateLibraryTrees(db, id, allowedTrees);
     await scanLibrary(db, library);
     watchers.set(id, watchLibrary(db, library));
     scanTimers.set(id, startLibraryScan(db, library));
@@ -116,22 +132,86 @@ export function createLibrariesRouter(db, watchers, scanTimers) {
 
   router.put("/:id", async (req, res) => {
     const { id } = req.params;
-    const { name, path, includeExtensions, excludeExtensions, nodes, scanIntervalMin } = req.body;
+    const { name, path, includeExtensions, excludeExtensions, nodes, scanIntervalMin, treeScope, allowedTrees } = req.body;
 
     const include_exts = includeExtensions ? JSON.stringify(includeExtensions) : null;
     const exclude_exts = excludeExtensions ? JSON.stringify(excludeExtensions) : null;
     const nodes_json = nodes ? JSON.stringify(nodes) : null;
-    const scan_interval_min = scanIntervalMin ? Number(scanIntervalMin) : null;
+     const scan_interval_min = scanIntervalMin ? Number(scanIntervalMin) : null;
+     const tree_scope = treeScope ?? null;
 
     db.prepare(
       `UPDATE libraries
-       SET name = ?, path = ?, include_exts = ?, exclude_exts = ?, nodes_json = ?, scan_interval_min = ?
+       SET name = ?, path = ?, include_exts = ?, exclude_exts = ?, nodes_json = ?, scan_interval_min = ?, tree_scope = ?
        WHERE id = ?`
-    ).run(name, path, include_exts, exclude_exts, nodes_json, scan_interval_min, id);
+     ).run(name, path, include_exts, exclude_exts, nodes_json, scan_interval_min, tree_scope, id);
+
+     updateLibraryTrees(db, id, allowedTrees);
 
     const library = db.prepare("SELECT * FROM libraries WHERE id = ?").get(id);
     res.json(library);
   });
 
+  router.delete("/:id", async (req, res) => {
+    const { id } = req.params;
+    const library = db.prepare("SELECT * FROM libraries WHERE id = ?").get(id);
+    if (!library) return res.status(404).json({ error: "library not found" });
+
+    const watcher = watchers.get(id);
+    if (watcher) {
+      try {
+        await watcher.close();
+      } catch {
+        // ignore
+      }
+      watchers.delete(id);
+    }
+
+    const timer = scanTimers.get(id);
+    if (timer) {
+      clearInterval(timer);
+      scanTimers.delete(id);
+    }
+
+    db.prepare("DELETE FROM jobs WHERE file_id IN (SELECT id FROM files WHERE library_id = ?)").run(id);
+    db.prepare("DELETE FROM files WHERE library_id = ?").run(id);
+    db.prepare("DELETE FROM library_tree_map WHERE library_id = ?").run(id);
+    db.prepare("DELETE FROM library_tree_rules WHERE library_id = ?").run(id);
+    db.prepare("DELETE FROM libraries WHERE id = ?").run(id);
+    pruneOrphanJobs(db);
+
+    res.json({ ok: true });
+  });
+
+  router.post("/:id/rescan", async (req, res) => {
+    const { id } = req.params;
+    const library = db.prepare("SELECT * FROM libraries WHERE id = ?").get(id);
+    if (!library) return res.status(404).json({ error: "library not found" });
+    await pruneMissingLibraryFiles(db, library);
+    await scanLibrary(db, library);
+    res.json({ ok: true });
+  });
+
   return router;
+}
+
+function updateLibraryTrees(db, libraryId, allowedTrees) {
+  if (!libraryId) return;
+  if (allowedTrees === undefined) return;
+  const list = Array.isArray(allowedTrees) ? allowedTrees : [];
+  db.prepare("DELETE FROM library_tree_rules WHERE library_id = ?").run(libraryId);
+  if (!list.length) return;
+
+  const latestVersionStmt = db.prepare(
+    "SELECT version FROM tree_versions WHERE tree_id = ? ORDER BY version DESC LIMIT 1"
+  );
+  const insertStmt = db.prepare(
+    "INSERT OR REPLACE INTO library_tree_rules (library_id, tree_id, tree_version) VALUES (?, ?, ?)"
+  );
+
+  list.forEach((treeId) => {
+    const versionRow = latestVersionStmt.get(treeId);
+    if (!versionRow?.version) return;
+    insertStmt.run(libraryId, treeId, versionRow.version);
+  });
 }

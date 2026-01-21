@@ -128,16 +128,43 @@ export function createTreesRouter(db) {
   });
 
   router.post("/", (req, res) => {
-    const { name, description, graph } = req.body;
+    const {
+      name,
+      description,
+      graph,
+      requiredAccelerators,
+      requiredProcessing,
+      requiredTagsAll,
+      requiredTagsAny,
+      requiredTagsNone,
+    } = req.body;
     if (!name) return res.status(400).json({ error: "name required" });
 
     const now = new Date().toISOString();
     const treeId = nanoid();
     const versionId = nanoid();
+    const required_accelerators = Array.isArray(requiredAccelerators)
+      ? JSON.stringify(requiredAccelerators)
+      : null;
+    const required_processing = requiredProcessing ?? null;
+    const required_tags_all = Array.isArray(requiredTagsAll) ? JSON.stringify(requiredTagsAll) : null;
+    const required_tags_any = Array.isArray(requiredTagsAny) ? JSON.stringify(requiredTagsAny) : null;
+    const required_tags_none = Array.isArray(requiredTagsNone) ? JSON.stringify(requiredTagsNone) : null;
 
     db.prepare(
-      "INSERT INTO trees (id, name, description, created_at, updated_at) VALUES (?, ?, ?, ?, ?)"
-    ).run(treeId, name, description ?? null, now, now);
+      "INSERT INTO trees (id, name, description, required_accelerators, required_processing, required_tags_all, required_tags_any, required_tags_none, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    ).run(
+      treeId,
+      name,
+      description ?? null,
+      required_accelerators,
+      required_processing,
+      required_tags_all,
+      required_tags_any,
+      required_tags_none,
+      now,
+      now
+    );
 
     const initialGraph =
       graph ??
@@ -175,19 +202,54 @@ export function createTreesRouter(db) {
 
     db.prepare("UPDATE trees SET updated_at = ? WHERE id = ?").run(now, id);
 
+    db.prepare(
+      "UPDATE library_tree_map SET tree_version = ? WHERE tree_id = ?"
+    ).run(nextVersion, id);
+
+    db.prepare(
+      "UPDATE library_tree_rules SET tree_version = ? WHERE tree_id = ?"
+    ).run(nextVersion, id);
+
     res.json({ treeId: id, version: nextVersion });
   });
 
   router.put("/:id", (req, res) => {
     const { id } = req.params;
-    const { name, description } = req.body;
+    const {
+      name,
+      description,
+      requiredAccelerators,
+      requiredProcessing,
+      requiredTagsAll,
+      requiredTagsAny,
+      requiredTagsNone,
+    } = req.body;
     const tree = db.prepare("SELECT * FROM trees WHERE id = ?").get(id);
     if (!tree) return res.status(404).json({ error: "tree not found" });
 
+    const required_accelerators = Array.isArray(requiredAccelerators)
+      ? JSON.stringify(requiredAccelerators)
+      : tree.required_accelerators ?? null;
+    const required_processing =
+      requiredProcessing !== undefined ? requiredProcessing : tree.required_processing ?? null;
+    const required_tags_all =
+      Array.isArray(requiredTagsAll) ? JSON.stringify(requiredTagsAll) : tree.required_tags_all ?? null;
+    const required_tags_any =
+      Array.isArray(requiredTagsAny) ? JSON.stringify(requiredTagsAny) : tree.required_tags_any ?? null;
+    const required_tags_none =
+      Array.isArray(requiredTagsNone) ? JSON.stringify(requiredTagsNone) : tree.required_tags_none ?? null;
+
     const now = new Date().toISOString();
-    db.prepare("UPDATE trees SET name = ?, description = ?, updated_at = ? WHERE id = ?").run(
+    db.prepare(
+      "UPDATE trees SET name = ?, description = ?, required_accelerators = ?, required_processing = ?, required_tags_all = ?, required_tags_any = ?, required_tags_none = ?, updated_at = ? WHERE id = ?"
+    ).run(
       name ?? tree.name,
       description ?? tree.description,
+      required_accelerators,
+      required_processing,
+      required_tags_all,
+      required_tags_any,
+      required_tags_none,
       now,
       id
     );
@@ -199,6 +261,7 @@ export function createTreesRouter(db) {
     const { id } = req.params;
     db.prepare("DELETE FROM tree_versions WHERE tree_id = ?").run(id);
     db.prepare("DELETE FROM library_tree_map WHERE tree_id = ?").run(id);
+    db.prepare("DELETE FROM library_tree_rules WHERE tree_id = ?").run(id);
     db.prepare("DELETE FROM trees WHERE id = ?").run(id);
     res.json({ ok: true });
   });

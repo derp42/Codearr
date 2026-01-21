@@ -14,6 +14,7 @@ export const def = createElementDef({
 export default {
   ...def,
   async execute({ context, log, ffprobeFile }) {
+    log?.("Verify integrity: start");
     const outputPath = context.outputPath ?? context.filePath;
     if (!outputPath) {
       log?.("Verify integrity: output missing");

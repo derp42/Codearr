@@ -18,12 +18,21 @@ let isLibraryModalOpen = false;
 let isLogModalOpen = false;
 let isTreeModalOpen = false;
 let isTreeAssignModalOpen = false;
+let isNodeSettingsModalOpen = false;
+let nodeSettingsState = { nodeId: null, name: "", values: {} };
 let isTreeDesignerActive = false;
 let treeDesignerRoot = null;
 let treeDesignerState = { treeId: null };
+let appConfig = { debug: false };
+let cachedTrees = [];
 let pendingTreeId = null;
+let treeNodeMenuState = { node: null };
 let currentLogJobId = null;
 let currentLogEntries = [];
+let logPollTimer = null;
+let lastLogSnapshot = "";
+let lastLogStatus = "";
+let openJobActionsId = null;
 const collapsedJobSections = new Set();
 const jobSectionPage = new Map();
 const jobSectionPageSize = new Map();
@@ -118,7 +127,7 @@ function renderSubnavVisibility() {
 
 async function checkHealth() {
   try {
-    const res = await fetch("/api/health");
+    const res = await fetchWithTimeout("/api/health", {}, 4000);
     if (!res.ok) throw new Error("Server offline");
     statusEl.textContent = "Server online";
   } catch {
@@ -127,52 +136,119 @@ async function checkHealth() {
 }
 
 async function renderDashboard() {
-  const [libs, nodes, stats] = await Promise.all([
+  document.body.classList.add("ui-refreshing");
+  const [libs, nodes, stats, jobs] = await Promise.all([
     fetchJson("/api/libraries"),
     fetchJson("/api/nodes"),
     fetchJson("/api/jobs/stats"),
+    fetchJson("/api/jobs/queue?limit=500"),
   ]);
   const counts = buildJobCounts(stats);
+  const totalFiles = libs.reduce((sum, lib) => sum + Number(lib.file_count ?? 0), 0);
+  const avgFilesPerLibrary = libs.length ? Math.round(totalFiles / libs.length) : 0;
+
+  const avgCpu = averageMetric(nodes.map((node) => node.metrics?.cpu?.load));
+  const avgRam = averageMetric(nodes.map((node) => node.metrics?.memory?.usedPercent));
+  const avgGpu = averageMetric(
+    nodes
+      .map((node) => averageGpuUtil(mergeGpuLists(node.hardware?.gpus, node.metrics?.gpus)))
+      .filter((value) => typeof value === "number")
+  );
+
+  const activeTranscodes = jobs.filter(
+    (job) => job.type === "transcode" && normalizeJobStatus(job.status) === "processing"
+  );
+  const avgFps = averageMetric(
+    activeTranscodes
+      .map((job) => extractFps(job.progress_message))
+      .filter((value) => typeof value === "number")
+  );
+
+  const totalErrors = counts.healthcheckError + counts.transcodeError;
 
   view.innerHTML = `
     <div class="card-grid">
-      <div class="card">
-        <h3>Libraries</h3>
-        <p class="muted">${libs.length} configured</p>
-      </div>
-      <div class="card">
-        <h3>Nodes</h3>
-        <p class="muted">${nodes.length} connected</p>
-      </div>
-      <div class="card">
-        <h3>Healthcheck</h3>
-        <p class="muted">${counts.healthcheckActive}</p>
-      </div>
-      <div class="card">
-        <h3>Health Failed</h3>
-        <p class="muted">${counts.healthcheckError}</p>
-      </div>
-      <div class="card">
-        <h3>Transcode</h3>
-        <p class="muted">${counts.transcodeActive}</p>
-      </div>
-      <div class="card">
-        <h3>Transcode Successful</h3>
-        <p class="muted">${counts.transcodeSuccess}</p>
-      </div>
-      <div class="card">
-        <h3>Transcode Failed</h3>
-        <p class="muted">${counts.transcodeError}</p>
-      </div>
+      <button class="card card-link" data-card-view="libraries">
+        <div class="card-meta">
+          <h3>Libraries</h3>
+          <span class="muted">${formatCount(libs.length)} configured</span>
+        </div>
+        <p class="muted">${formatCount(totalFiles)} files total</p>
+        <p class="muted">${formatCount(avgFilesPerLibrary)} avg per library</p>
+      </button>
+      <button class="card card-link" data-card-view="nodes">
+        <div class="card-meta">
+          <h3>Nodes</h3>
+          <span class="muted">${formatCount(nodes.length)} connected</span>
+        </div>
+        <div class="card-summary">
+          ${renderRingGauge(avgCpu, avgRam, avgGpu)}
+          <div class="metric-list">
+            <div><span>CPU</span>${formatPercent(avgCpu)}</div>
+            <div><span>RAM</span>${formatPercent(avgRam)}</div>
+            <div><span>GPU</span>${formatPercent(avgGpu)}</div>
+          </div>
+        </div>
+      </button>
+      <button class="card card-link" data-card-view="jobs">
+        <div class="card-meta">
+          <h3>Healthcheck Queue</h3>
+          <span class="muted">${formatCount(counts.healthcheckActive)} active</span>
+        </div>
+        <p class="muted">Errors: ${formatCount(counts.healthcheckError)}</p>
+      </button>
+      <button class="card card-link" data-card-view="jobs">
+        <div class="card-meta">
+          <h3>Transcode Queue</h3>
+          <span class="muted">${formatCount(counts.transcodeActive)} active</span>
+        </div>
+        <p class="muted">Successful: ${formatCount(counts.transcodeSuccess)}</p>
+        <p class="muted">Failed: ${formatCount(counts.transcodeError)}</p>
+      </button>
+      <button class="card card-link" data-card-view="jobs">
+        <div class="card-meta">
+          <h3>Transcode Performance</h3>
+          <span class="muted">${formatCount(activeTranscodes.length)} processing</span>
+        </div>
+        <p class="muted">Avg FPS: ${avgFps != null ? formatFps(avgFps) : "-"}</p>
+        <p class="muted">Queue depth: ${formatCount(counts.transcodeActive)}</p>
+      </button>
+      <button class="card card-link" data-card-view="jobs">
+        <div class="card-meta">
+          <h3>Error Queue</h3>
+          <span class="muted">${formatCount(totalErrors)} total</span>
+        </div>
+        <p class="muted">Health: ${formatCount(counts.healthcheckError)} • Transcode: ${formatCount(counts.transcodeError)}</p>
+      </button>
     </div>
   `;
+
+  bindDashboardCards();
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+      document.body.classList.remove("ui-refreshing");
+    });
+  });
+}
+
+function bindDashboardCards() {
+  view.querySelectorAll("[data-card-view]").forEach((card) => {
+    card.addEventListener("click", () => {
+      const viewName = card.dataset.cardView;
+      if (viewName) setActiveView(viewName);
+    });
+  });
 }
 
 async function renderLibraries() {
   const existingName = document.querySelector("#library-form input[name='name']")?.value;
   const existingPath = document.querySelector("#library-form input[name='path']")?.value;
-  const existingInclude = document.querySelector("#library-form input[name='includeExtensions']")?.value;
-  const existingExclude = document.querySelector("#library-form input[name='excludeExtensions']")?.value;
+  const existingInclude = document.querySelector(
+    "#library-form input[name='includeExtensions']"
+  )?.value;
+  const existingExclude = document.querySelector(
+    "#library-form input[name='excludeExtensions']"
+  )?.value;
   const existingNodes = document.querySelector("#library-form input[name='nodes']")?.value;
   const existingScan = document.querySelector("#library-form input[name='scanIntervalMin']")?.value;
   if (existingName !== undefined) libraryFormState.name = existingName;
@@ -182,8 +258,12 @@ async function renderLibraries() {
   if (existingNodes !== undefined) libraryFormState.nodes = existingNodes;
   if (existingScan !== undefined) libraryFormState.scanIntervalMin = existingScan;
 
-  const libs = await fetchJson("/api/libraries");
-  const nodes = await fetchJson("/api/nodes");
+  const [libs, nodes, trees] = await Promise.all([
+    fetchJson("/api/libraries"),
+    fetchJson("/api/nodes"),
+    fetchJson("/api/trees"),
+  ]);
+  cachedTrees = Array.isArray(trees) ? trees : [];
   const nodeNames = nodes.map((node) => node.name).sort();
 
   view.innerHTML = `
@@ -204,11 +284,10 @@ async function renderLibraries() {
         </thead>
         <tbody>
           ${libs
-            .map(
-              (lib) => {
-                const isExpanded = expandedLibraries.has(lib.id);
-                const detailsRow = renderLibraryDetailsRow(lib, isExpanded);
-                return `
+            .map((lib) => {
+              const isExpanded = expandedLibraries.has(lib.id);
+              const detailsRow = renderLibraryDetailsRow(lib, isExpanded);
+              return `
                   <tr>
                     <td>${lib.name}</td>
                     <td>${lib.path}</td>
@@ -216,18 +295,19 @@ async function renderLibraries() {
                     <td>${new Date(lib.created_at).toLocaleString()}</td>
                     <td>
                       <button class="ghost" data-library-toggle="${lib.id}">Files</button>
+                      <button class="ghost" data-library-rescan="${lib.id}">Rescan</button>
                       <button class="ghost" data-library-edit="${lib.id}">Edit</button>
+                      <button class="ghost danger" data-library-delete="${lib.id}">Delete</button>
                     </td>
                   </tr>
                   ${detailsRow}
                 `;
-              }
-            )
+            })
             .join("")}
         </tbody>
       </table>
     </div>
-    ${renderLibraryModal(nodeNames)}
+    ${renderLibraryModal(nodeNames, cachedTrees)}
   `;
 
   const addBtn = document.getElementById("add-library");
@@ -252,6 +332,29 @@ async function renderLibraries() {
       const libId = btn.dataset.libraryEdit;
       const lib = libs.find((item) => item.id === libId);
       openLibraryModal(lib);
+    });
+  });
+
+  const rescanButtons = view.querySelectorAll("button[data-library-rescan]");
+  rescanButtons.forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const libId = btn.dataset.libraryRescan;
+      if (!libId) return;
+      await fetch(`/api/libraries/${libId}/rescan`, { method: "POST" });
+      await renderLibraries();
+    });
+  });
+
+  const deleteButtons = view.querySelectorAll("button[data-library-delete]");
+  deleteButtons.forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const libId = btn.dataset.libraryDelete;
+      const lib = libs.find((item) => item.id === libId);
+      const name = lib?.name ?? "this library";
+      if (!confirm(`Delete ${name}? This will remove its jobs and files.`)) return;
+      await fetch(`/api/libraries/${libId}`, { method: "DELETE" });
+      expandedLibraries.delete(libId);
+      await renderLibraries();
     });
   });
 
@@ -305,6 +408,7 @@ async function renderNodes() {
                 node.last_seen,
                 ramDetailText
               );
+
               return `<tr>
                 <td>${node.name}</td>
                 <td><span class="status-pill ${staleClass}">${status}</span></td>
@@ -318,6 +422,7 @@ async function renderNodes() {
                       ? `<button class="danger" data-node-id="${node.id}">Delete</button>`
                       : `<button class="ghost" data-gpu-toggle="${node.id}">Details</button>`
                   }
+                  <button class="ghost" data-node-limits="${node.id}">Limits</button>
                 </td>
               </tr>${detailsRow}`;
             })
@@ -325,6 +430,7 @@ async function renderNodes() {
         </tbody>
       </table>
     </div>
+    ${renderNodeSettingsModal()}
   `;
 
   const toggle = document.getElementById("toggle-stale");
@@ -342,6 +448,17 @@ async function renderNodes() {
     });
   });
 
+
+  const limitsButtons = view.querySelectorAll("button[data-node-limits]");
+  limitsButtons.forEach((button) => {
+    button.addEventListener("click", () => {
+      const nodeId = button.dataset.nodeLimits;
+      const node = nodes.find((item) => item.id === nodeId);
+      openNodeSettingsModal(node);
+    });
+  });
+
+  bindNodeSettingsModal();
   const gpuButtons = view.querySelectorAll("button[data-gpu-toggle]");
   gpuButtons.forEach((btn) => {
     btn.addEventListener("click", async () => {
@@ -456,6 +573,8 @@ async function renderJobs() {
                     .map((job) => {
                       const normalizedStatus = normalizeJobStatus(job.status);
                       const canReenqueue = normalizedStatus === "error";
+                      const isTranscodeSuccess =
+                        normalizedStatus === "successful" && job.type === "transcode";
                       const typeText = job.type ?? "-";
                       const fileName = getFileName(job.file_path ?? job.new_path ?? "");
                       const jobTitle = fileName || job.file_id || job.id;
@@ -467,16 +586,41 @@ async function renderJobs() {
                           </td>
                           <td>${typeText}</td>
                           <td>${normalizedStatus}</td>
-                          <td>${job.progress ?? 0}%</td>
+                          <td>${formatJobProgress(job)}</td>
                           <td>${job.assigned_node_id ?? "-"}</td>
                           <td>${new Date(job.updated_at).toLocaleString()}</td>
                           <td>
-                            ${
-                              canReenqueue
-                                ? `<button class="ghost" data-reenqueue-status="${normalizedStatus}" data-reenqueue-type="${job.type}">Re-enqueue</button>`
-                                : ""
-                            }
-                            <button class="ghost" data-job-logs="${job.id}">Logs</button>
+                            <div class="job-actions">
+                              ${
+                                canReenqueue
+                                  ? `<button class="ghost" data-reenqueue-status="${normalizedStatus}" data-reenqueue-type="${job.type}">Re-enqueue</button>`
+                                  : ""
+                              }
+                              ${
+                                isTranscodeSuccess
+                                  ? `
+                                    <div class="job-action-wrap">
+                                      <button class="icon-button" data-job-actions="${job.id}" aria-label="Actions" title="Actions">
+                                        <svg viewBox="0 0 24 24" aria-hidden="true">
+                                          <path d="M19.4 13.5c.04-.5.04-1 .02-1.5l2-1.6c.18-.14.23-.4.12-.6l-1.9-3.3c-.11-.2-.36-.28-.57-.2l-2.3.9c-.4-.3-.9-.6-1.4-.8l-.3-2.4a.48.48 0 0 0-.48-.42h-3.8c-.24 0-.45.18-.48.42l-.3 2.4c-.5.2-1 .5-1.4.8l-2.3-.9c-.21-.08-.46 0-.57.2L2.7 9.8c-.11.2-.06.46.12.6l2 1.6c-.02.5-.02 1 .02 1.5l-2 1.6c-.18.14-.23.4-.12.6l1.9 3.3c.11.2.36.28.57.2l2.3-.9c.4.3.9.6 1.4.8l.3 2.4c.03.24.24.42.48.42h3.8c.24 0 .45-.18.48-.42l.3-2.4c.5-.2 1-.5 1.4-.8l2.3.9c.21.08.46 0 .57-.2l1.9-3.3c.11-.2.06-.46-.12-.6l-2-1.6ZM12 15.6a3.6 3.6 0 1 1 0-7.2 3.6 3.6 0 0 1 0 7.2Z"/>
+                                        </svg>
+                                        <span class="icon-label">Actions</span>
+                                      </button>
+                                      <div class="job-action-menu hidden" data-job-action-menu="${job.id}">
+                                        <button class="job-action-item" data-action-item="healthcheck" data-job-id="${job.id}">Send to healthcheck</button>
+                                        <button class="job-action-item" data-action-item="transcode" data-job-id="${job.id}">Send to transcode</button>
+                                      </div>
+                                    </div>
+                                  `
+                                  : ""
+                              }
+                              <button class="icon-button" data-job-logs="${job.id}" aria-label="Logs" title="Logs">
+                                <svg viewBox="0 0 24 24" aria-hidden="true">
+                                  <path d="M6 2h8l4 4v16H6V2Zm8 1.5V7h3.5L14 3.5ZM8.5 10h7v1.6h-7V10Zm0 3h7v1.6h-7V13Zm0 3h5.2v1.6H8.5V16Z"/>
+                                </svg>
+                                <span class="icon-label">Logs</span>
+                              </button>
+                            </div>
                           </td>
                         </tr>
                       `;
@@ -582,6 +726,46 @@ async function renderJobs() {
     });
   });
 
+  if (openJobActionsId) {
+    const menu = view.querySelector(`[data-job-action-menu='${openJobActionsId}']`);
+    if (menu) menu.classList.remove("hidden");
+  }
+
+  const actionButtons = view.querySelectorAll("button[data-job-actions]");
+  actionButtons.forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const jobId = button.dataset.jobActions;
+      if (!jobId) return;
+      const menu = view.querySelector(`[data-job-action-menu='${jobId}']`);
+      if (!menu) return;
+      const isHidden = menu.classList.contains("hidden");
+      view.querySelectorAll(".job-action-menu").forEach((item) => item.classList.add("hidden"));
+      menu.classList.toggle("hidden", !isHidden);
+      openJobActionsId = isHidden ? jobId : null;
+    });
+  });
+
+  view.addEventListener("click", (event) => {
+    const target = event.target.closest("button[data-action-item]");
+    if (!target) {
+      view.querySelectorAll(".job-action-menu").forEach((item) => item.classList.add("hidden"));
+      openJobActionsId = null;
+      return;
+    }
+    const jobId = target.dataset.jobId;
+    const targetType = target.dataset.actionItem;
+    if (!jobId || !targetType) return;
+    fetch("/api/jobs/requeue", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jobId, targetType }),
+    }).then(() => {
+      openJobActionsId = null;
+      renderJobs();
+    });
+  });
+
   const logButtons = view.querySelectorAll("button[data-job-logs]");
   logButtons.forEach((btn) => {
     btn.addEventListener("click", () => {
@@ -617,6 +801,7 @@ async function renderTrees() {
           <button class="ghost" id="tree-designer-save" disabled>Save</button>
           <select id="tree-actions" class="tree-actions">
             <option value="">Actions</option>
+            <option value="edit">Edit tree settings</option>
             <option value="delete">Delete tree</option>
           </select>
         </div>
@@ -645,6 +830,13 @@ async function renderTrees() {
   document.getElementById("tree-actions")?.addEventListener("change", async (event) => {
     const action = event.target.value;
     event.target.value = "";
+    if (action === "edit") {
+      const treeId = treeDesignerState.treeId;
+      if (!treeId) return;
+      const tree = await fetchJson(`/api/trees/${treeId}`);
+      openTreeModal(tree);
+      return;
+    }
     if (action === "delete") {
       const treeId = treeDesignerState.treeId;
       if (!treeId) return;
@@ -662,10 +854,41 @@ async function renderTrees() {
   }
 }
 
-async function fetchJson(url) {
-  const res = await fetch(url);
+async function fetchJson(url, { timeoutMs = 8000 } = {}) {
+  const res = await fetchWithTimeout(url, {}, timeoutMs);
   if (!res.ok) throw new Error("Request failed");
   return res.json();
+}
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = 8000) {
+  if (typeof AbortController === "undefined") {
+    return fetch(url, options);
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function loadAppConfig() {
+  try {
+    appConfig = await fetchJson("/api/config");
+  } catch {
+    appConfig = appConfig ?? { debug: false };
+  }
+}
+
+function showLoadError(message) {
+  if (!view) return;
+  view.innerHTML = `
+    <div class="card">
+      <h3>Unable to load data</h3>
+      <p class="muted">${message}</p>
+    </div>
+  `;
 }
 
 function formatBytes(value) {
@@ -702,6 +925,48 @@ function formatBytesBinary(value) {
     unitIndex += 1;
   }
   return `${size.toFixed(1)}${units[unitIndex]}`;
+}
+
+function formatSubtitleList(value) {
+  if (!value) return "-";
+  if (Array.isArray(value)) return value.length ? value.join(",") : "none";
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value);
+      if (Array.isArray(parsed)) return parsed.length ? parsed.join(",") : "none";
+    } catch {
+      // ignore
+    }
+    return value.trim() || "-";
+  }
+  return "-";
+}
+
+function formatDurationSeconds(value) {
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds) || seconds <= 0) return "-";
+  const total = Math.round(seconds);
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const secs = total % 60;
+  const padded = (num) => String(num).padStart(2, "0");
+  return hours > 0
+    ? `${hours}:${padded(minutes)}:${padded(secs)}`
+    : `${minutes}:${padded(secs)}`;
+}
+
+function formatFrameCount(value) {
+  const count = Number(value);
+  if (!Number.isFinite(count) || count <= 0) return "-";
+  return `${Math.round(count)}f`;
+}
+
+function normalizeContainerDisplay(value) {
+  const name = String(value ?? "").toLowerCase();
+  if (!name || name === "-") return "-";
+  if (name === "matroska") return "mkv";
+  if (name === "quicktime") return "mov";
+  return name;
 }
 
 function formatRamUsage(usedBytes, totalBytes) {
@@ -774,6 +1039,67 @@ function renderUsageMeter(value, text, hideText = false) {
     <div class="usage-meter" title="${text ?? display}">
       <div class="usage-text">${display}</div>
       <div class="usage-bar"><div class="usage-fill" style="width:${clamped}%;"></div></div>
+    </div>
+  `;
+}
+
+function formatJobProgress(job) {
+  const progressValue = Number(job?.progress ?? 0);
+  const percent = Number.isFinite(progressValue) ? Math.round(progressValue) : 0;
+  const fps = extractFps(job?.progress_message);
+  if (fps != null) return `${percent}% • ${formatFps(fps)} fps`;
+  return `${percent}%`;
+}
+
+function extractFps(message) {
+  if (!message) return null;
+  const match = String(message).match(/fps=\s*([0-9.]+)/i);
+  if (!match) return null;
+  const value = Number(match[1]);
+  return Number.isFinite(value) ? value : null;
+}
+
+function formatFps(value) {
+  const rounded = Math.round(value * 10) / 10;
+  if (Number.isNaN(rounded)) return "-";
+  return rounded % 1 === 0 ? String(rounded.toFixed(0)) : String(rounded);
+}
+
+function averageMetric(values) {
+  const cleaned = (values ?? []).filter((value) => typeof value === "number" && !Number.isNaN(value));
+  if (!cleaned.length) return null;
+  const total = cleaned.reduce((sum, value) => sum + value, 0);
+  return total / cleaned.length;
+}
+
+function formatCount(value) {
+  const numberValue = Number(value ?? 0);
+  if (!Number.isFinite(numberValue)) return "-";
+  return new Intl.NumberFormat().format(numberValue);
+}
+
+function formatPercent(value) {
+  if (typeof value !== "number" || Number.isNaN(value)) return "-";
+  const rounded = Math.round(value * 10) / 10;
+  return rounded % 1 === 0 ? `${rounded.toFixed(0)}%` : `${rounded.toFixed(1)}%`;
+}
+
+function clampPercent(value) {
+  if (typeof value !== "number" || Number.isNaN(value)) return 0;
+  return Math.max(0, Math.min(100, value));
+}
+
+function renderRingGauge(cpu, ram, gpu) {
+  const cpuValue = clampPercent(cpu);
+  const ramValue = clampPercent(ram);
+  const gpuValue = clampPercent(gpu);
+  const ariaLabel = `CPU ${formatPercent(cpu)}, RAM ${formatPercent(ram)}, GPU ${formatPercent(gpu)}`;
+  return `
+    <div class="ring-gauge" role="img" aria-label="${ariaLabel}">
+      <span class="ring" style="--value:${cpuValue}; --ring-color:#6d7dff; --thickness:8px; --inset:0px;"></span>
+      <span class="ring" style="--value:${ramValue}; --ring-color:#2fe3bb; --thickness:8px; --inset:10px;"></span>
+      <span class="ring" style="--value:${gpuValue}; --ring-color:#ffcc70; --thickness:8px; --inset:20px;"></span>
+      <span class="ring-center">AVG</span>
     </div>
   `;
 }
@@ -949,6 +1275,7 @@ function isUserEditing() {
     isLogModalOpen ||
     isTreeModalOpen ||
     isTreeAssignModalOpen ||
+    isNodeSettingsModalOpen ||
     isTreeDesignerActive
   ) {
     return true;
@@ -1006,14 +1333,22 @@ async function renderLibraryFiles(libId, offset) {
           .map((file) => {
             const name = file.path ? file.path.split(/[/\\]/).pop() : "-";
             const initialSize = formatBytes(file.initial_size ?? file.size ?? 0);
-            const initialContainer = file.initial_container ?? "-";
+            const initialContainer = normalizeContainerDisplay(file.initial_container ?? "-");
             const initialCodec = file.initial_codec ?? "-";
+            const initialAudio = file.initial_audio_codec ?? "-";
+            const initialSubs = formatSubtitleList(file.initial_subtitles);
+            const initialDuration = formatDurationSeconds(file.initial_duration_sec);
+            const initialFrames = formatFrameCount(file.initial_frame_count);
             const finalSize = file.final_size ? formatBytes(file.final_size) : "-";
-            const finalContainer = file.final_container ?? "-";
+            const finalContainer = normalizeContainerDisplay(file.final_container ?? "-");
             const finalCodec = file.final_codec ?? "-";
+            const finalAudio = file.final_audio_codec ?? "-";
+            const finalSubs = formatSubtitleList(file.final_subtitles);
+            const finalDuration = formatDurationSeconds(file.final_duration_sec);
+            const finalFrames = formatFrameCount(file.final_frame_count);
             const newName = file.new_path ? file.new_path.split(/[/\\]/).pop() : "-";
-            const initialText = `${initialSize} · ${initialContainer} · ${initialCodec}`;
-            const finalText = `${finalSize} · ${finalContainer} · ${finalCodec}`;
+            const initialText = `${initialSize} · ${initialContainer} · ${initialCodec} · ${initialAudio} · ${initialSubs} · ${initialDuration} · ${initialFrames}`;
+            const finalText = `${finalSize} · ${finalContainer} · ${finalCodec} · ${finalAudio} · ${finalSubs} · ${finalDuration} · ${finalFrames}`;
             return `
               <tr>
                 <td title="${file.path ?? ""}">${name}</td>
@@ -1043,7 +1378,7 @@ async function renderLibraryFiles(libId, offset) {
   });
 }
 
-function renderLibraryModal(nodeNames) {
+function renderLibraryModal(nodeNames, trees = []) {
   return `
     <div class="modal-backdrop hidden" id="library-modal-backdrop">
       <div class="modal">
@@ -1058,6 +1393,20 @@ function renderLibraryModal(nodeNames) {
           <input name="excludeExtensions" placeholder="Exclude extensions (csv)" />
           <input name="nodes" placeholder="Allowed nodes (csv)" list="node-names" />
           <input name="scanIntervalMin" placeholder="Scan interval minutes (default 15)" />
+          <label class="field-label">Tree selection</label>
+          <select name="treeScope">
+            <option value="selected">Selected trees</option>
+            <option value="any">Any tree</option>
+          </select>
+          <div class="field-hint">Choose which trees are eligible for this library.</div>
+          <div class="checkbox-group" id="tree-allowlist">
+            ${trees
+              .map(
+                (tree) =>
+                  `<label><input type="checkbox" name="allowedTrees" value="${tree.id}" /> ${tree.name} (v${tree.latest_version ?? "-"})</label>`
+              )
+              .join("")}
+          </div>
           <datalist id="node-names">
             ${nodeNames.map((name) => `<option value="${name}"></option>`).join("")}
           </datalist>
@@ -1069,7 +1418,158 @@ function renderLibraryModal(nodeNames) {
   `;
 }
 
-function openLibraryModal(library) {
+function renderNodeSettingsModal() {
+  return `
+    <div class="modal-backdrop hidden" id="node-settings-backdrop">
+      <div class="modal">
+        <div class="modal-header">
+          <h3 id="node-settings-title">Node Limits</h3>
+          <button class="ghost" id="node-settings-close">Close</button>
+        </div>
+        <form class="form" id="node-settings-form">
+          <div class="field-hint" id="gpu-targets-hint"></div>
+          <label class="field-label" for="healthcheckSlotsCpu">Healthcheck CPU slots</label>
+          <input id="healthcheckSlotsCpu" name="healthcheckSlotsCpu" placeholder="e.g. 2" />
+          <label class="field-label" for="healthcheckSlotsGpu">Healthcheck GPU slots</label>
+          <input id="healthcheckSlotsGpu" name="healthcheckSlotsGpu" placeholder="e.g. 1" />
+          <label class="field-label" for="targetHealthcheckCpu">Healthcheck CPU target % (-1 to ignore)</label>
+          <input id="targetHealthcheckCpu" name="targetHealthcheckCpu" placeholder="e.g. 60" />
+          <label class="field-label" for="healthcheckGpuTargets">Healthcheck GPU targets (comma list)</label>
+          <input id="healthcheckGpuTargets" name="healthcheckGpuTargets" placeholder="e.g. 70,60" />
+          <label class="field-label" for="transcodeSlotsCpu">Transcode CPU slots</label>
+          <input id="transcodeSlotsCpu" name="transcodeSlotsCpu" placeholder="e.g. 1" />
+          <label class="field-label" for="transcodeSlotsGpu">Transcode GPU slots</label>
+          <input id="transcodeSlotsGpu" name="transcodeSlotsGpu" placeholder="e.g. 2" />
+          <label class="field-label" for="targetTranscodeCpu">Transcode CPU target % (-1 to ignore)</label>
+          <input id="targetTranscodeCpu" name="targetTranscodeCpu" placeholder="e.g. 75" />
+          <label class="field-label" for="transcodeGpuTargets">Transcode GPU targets (comma list)</label>
+          <input id="transcodeGpuTargets" name="transcodeGpuTargets" placeholder="e.g. 80,70" />
+          <button class="primary" type="submit">Save Limits</button>
+        </form>
+      </div>
+    </div>
+  `;
+}
+
+function openNodeSettingsModal(node) {
+  const backdrop = document.getElementById("node-settings-backdrop");
+  if (!backdrop || !node) return;
+  const form = document.getElementById("node-settings-form");
+  const title = document.getElementById("node-settings-title");
+  if (title) title.textContent = `Node Limits: ${node.name}`;
+
+  const settings = node.settings ?? {};
+  const gpuCount = Array.isArray(node.hardware?.gpus) ? node.hardware.gpus.length : 0;
+  nodeSettingsState = {
+    nodeId: node.id,
+    name: node.name,
+    values: {
+      healthcheckSlotsCpu: settings.healthcheckSlotsCpu ?? "",
+      healthcheckSlotsGpu: settings.healthcheckSlotsGpu ?? "",
+      targetHealthcheckCpu: settings.targetHealthcheckCpu ?? "",
+      healthcheckGpuTargets: normalizeGpuTargetList(settings.healthcheckGpuTargets ?? "", gpuCount),
+      transcodeSlotsCpu: settings.transcodeSlotsCpu ?? "",
+      transcodeSlotsGpu: settings.transcodeSlotsGpu ?? "",
+      targetTranscodeCpu: settings.targetTranscodeCpu ?? "",
+      transcodeGpuTargets: normalizeGpuTargetList(settings.transcodeGpuTargets ?? "", gpuCount),
+    },
+    gpuCount,
+  };
+
+  if (form) {
+    form.healthcheckSlotsCpu.value = nodeSettingsState.values.healthcheckSlotsCpu;
+    form.healthcheckSlotsGpu.value = nodeSettingsState.values.healthcheckSlotsGpu;
+    form.targetHealthcheckCpu.value = nodeSettingsState.values.targetHealthcheckCpu;
+    form.healthcheckGpuTargets.value = nodeSettingsState.values.healthcheckGpuTargets;
+    form.transcodeSlotsCpu.value = nodeSettingsState.values.transcodeSlotsCpu;
+    form.transcodeSlotsGpu.value = nodeSettingsState.values.transcodeSlotsGpu;
+    form.targetTranscodeCpu.value = nodeSettingsState.values.targetTranscodeCpu;
+    form.transcodeGpuTargets.value = nodeSettingsState.values.transcodeGpuTargets;
+  }
+
+  const hint = document.getElementById("gpu-targets-hint");
+  if (hint) {
+    hint.textContent = gpuCount
+      ? `GPU targets expect ${gpuCount} values. -1 = ignore utilization, 0 = disable GPU.`
+      : "No GPUs detected for this node.";
+  }
+
+  backdrop.classList.remove("hidden");
+  isNodeSettingsModalOpen = true;
+}
+
+function closeNodeSettingsModal() {
+  const backdrop = document.getElementById("node-settings-backdrop");
+  if (!backdrop) return;
+  backdrop.classList.add("hidden");
+  isNodeSettingsModalOpen = false;
+}
+
+function bindNodeSettingsModal() {
+  const backdrop = document.getElementById("node-settings-backdrop");
+  const form = document.getElementById("node-settings-form");
+  const closeBtn = document.getElementById("node-settings-close");
+  if (!backdrop || !form || !closeBtn) return;
+
+  closeBtn.addEventListener("click", () => closeNodeSettingsModal());
+  backdrop.addEventListener("click", (event) => {
+    if (event.target === backdrop) closeNodeSettingsModal();
+  });
+
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (!nodeSettingsState.nodeId) return;
+    const payload = {
+      healthcheckSlotsCpu: parseOptionalNumber(form.healthcheckSlotsCpu.value),
+      healthcheckSlotsGpu: parseOptionalNumber(form.healthcheckSlotsGpu.value),
+      targetHealthcheckCpu: parseOptionalNumber(form.targetHealthcheckCpu.value),
+      healthcheckGpuTargets: normalizeGpuTargetList(form.healthcheckGpuTargets.value, nodeSettingsState.gpuCount),
+      transcodeSlotsCpu: parseOptionalNumber(form.transcodeSlotsCpu.value),
+      transcodeSlotsGpu: parseOptionalNumber(form.transcodeSlotsGpu.value),
+      targetTranscodeCpu: parseOptionalNumber(form.targetTranscodeCpu.value),
+      transcodeGpuTargets: normalizeGpuTargetList(form.transcodeGpuTargets.value, nodeSettingsState.gpuCount),
+    };
+
+    await fetch(`/api/nodes/${nodeSettingsState.nodeId}/settings`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+
+    closeNodeSettingsModal();
+    await renderNodes();
+  });
+}
+
+function parseOptionalNumber(value) {
+  if (value === undefined || value === null) return undefined;
+  const trimmed = String(value).trim();
+  if (!trimmed) return undefined;
+  const num = Number(trimmed);
+  return Number.isFinite(num) ? num : undefined;
+}
+
+function parseOptionalText(value) {
+  if (value === undefined || value === null) return undefined;
+  const trimmed = String(value).trim();
+  return trimmed.length ? trimmed : undefined;
+}
+
+function normalizeGpuTargetList(value, gpuCount) {
+  if (!gpuCount || gpuCount <= 0) return "";
+  const parts = String(value ?? "")
+    .split(/[,\s]+/)
+    .map((part) => part.trim())
+    .filter((part) => part.length > 0)
+    .map((part) => Number(part))
+    .map((num) => (Number.isFinite(num) ? num : 0));
+
+  const capped = parts.slice(0, gpuCount);
+  while (capped.length < gpuCount) capped.push(0);
+  return capped.join(",");
+}
+
+async function openLibraryModal(library) {
   const backdrop = document.getElementById("library-modal-backdrop");
   if (!backdrop) return;
   backdrop.classList.remove("hidden");
@@ -1087,6 +1587,40 @@ function openLibraryModal(library) {
   form.elements.excludeExtensions.value = parseJsonList(library?.exclude_exts).join(", ");
   form.elements.nodes.value = parseJsonList(library?.nodes_json).join(", ");
   form.elements.scanIntervalMin.value = library?.scan_interval_min ?? "";
+
+  await applyLibraryTreeSelection(library);
+}
+
+async function applyLibraryTreeSelection(library) {
+  const form = document.getElementById("library-form");
+  if (!form) return;
+  const scopeField = form.elements.treeScope;
+  const allowlist = document.getElementById("tree-allowlist");
+
+  if (!library?.id) {
+    if (scopeField) scopeField.value = "selected";
+    allowlist?.classList.remove("hidden");
+    allowlist
+      ?.querySelectorAll("input[name='allowedTrees']")
+      .forEach((input) => (input.checked = false));
+    return;
+  }
+
+  try {
+    const data = await fetchJson(`/api/libraries/${library.id}/trees`);
+    const treeScope = data?.tree_scope ?? library?.tree_scope ?? "selected";
+    if (scopeField) scopeField.value = treeScope;
+    allowlist?.classList.toggle("hidden", treeScope === "any");
+    const allowedIds = new Set((data?.trees ?? []).map((row) => row.tree_id));
+    allowlist
+      ?.querySelectorAll("input[name='allowedTrees']")
+      .forEach((input) => {
+        input.checked = allowedIds.has(input.value);
+      });
+  } catch {
+    if (scopeField) scopeField.value = library?.tree_scope ?? "selected";
+    allowlist?.classList.toggle("hidden", scopeField?.value === "any");
+  }
 }
 
 function closeLibraryModal() {
@@ -1097,6 +1631,9 @@ function closeLibraryModal() {
 }
 
 function renderLogModal() {
+  if (document.getElementById("log-modal-backdrop")) {
+    return "";
+  }
   return `
     <div class="modal-backdrop hidden" id="log-modal-backdrop">
       <div class="modal log-modal">
@@ -1104,7 +1641,16 @@ function renderLogModal() {
           <h3 id="log-modal-title">Job Logs</h3>
           <button class="ghost" id="log-modal-close">Close</button>
         </div>
-        <div class="log-meta" id="log-meta"></div>
+        <div class="log-meta" id="log-meta">
+          <div class="log-meta-header">
+            <button class="ghost log-meta-toggle" id="log-meta-toggle" type="button" aria-expanded="false">
+              <span>Details</span>
+              <span class="log-meta-caret">▾</span>
+            </button>
+            <div class="log-meta-summary" id="log-meta-summary"></div>
+          </div>
+          <div class="log-meta-body" id="log-meta-body"></div>
+        </div>
         <div class="log-layout">
           <div class="log-list" id="log-list"></div>
           <div class="log-content" id="log-content">
@@ -1161,17 +1707,60 @@ function parseJobLogEntries(job) {
     ];
   }
 
+  const ordered = [...entries].sort((a, b) => a.order - b.order);
+  const runs = [];
+  const runCounts = new Map();
+
+  const createRun = (label, ts) => {
+    const run = {
+      id: runs.length,
+      stage: label,
+      ts: ts ?? null,
+      order: runs.length,
+      messages: [],
+    };
+    runs.push(run);
+    return run;
+  };
+
+  let currentRun = null;
+
+  ordered.forEach((entry) => {
+    const message = entry.message ?? "";
+    const isRunStart = entry.stage === "system" && message.startsWith("Run started");
+    if (isRunStart) {
+      const typeMatch = message.match(/type=([a-z0-9_]+)/i);
+      const runType = (typeMatch?.[1] ?? "run").toLowerCase();
+      const count = (runCounts.get(runType) ?? 0) + 1;
+      runCounts.set(runType, count);
+      currentRun = createRun(`${runType} run #${count}`, entry.ts);
+    }
+
+    if (!currentRun) {
+      const count = (runCounts.get("legacy") ?? 0) + 1;
+      runCounts.set("legacy", count);
+      currentRun = createRun(`legacy run #${count}`, entry.ts);
+    }
+
+    currentRun.messages.push(message);
+  });
+
   if (legacyLines.length) {
-    entries.push({
-      id: entries.length,
-      stage: job?.type ?? "legacy",
-      ts: null,
-      message: legacyLines.join("\n"),
-      order: lines.length + 1,
-    });
+    if (!currentRun) {
+      const count = (runCounts.get("legacy") ?? 0) + 1;
+      runCounts.set("legacy", count);
+      currentRun = createRun(`legacy run #${count}`, null);
+    }
+    currentRun.messages.push(...legacyLines);
   }
 
-  return entries;
+  return runs.map((run, index) => ({
+    id: index,
+    stage: run.stage,
+    ts: run.ts,
+    message: run.messages.join("\n"),
+    order: run.order,
+  }));
 }
 
 function formatLogTimestamp(value) {
@@ -1184,8 +1773,38 @@ function formatLogTimestamp(value) {
 function openLogModal(job) {
   const backdrop = document.getElementById("log-modal-backdrop");
   if (!backdrop) return;
+  if (backdrop.parentElement !== document.body) {
+    document.body.appendChild(backdrop);
+  }
 
   currentLogJobId = job?.id ?? null;
+  lastLogSnapshot = job?.log_text ?? "";
+  lastLogStatus = job?.status ?? "";
+  updateLogModal(job);
+
+  backdrop.classList.remove("hidden");
+  isLogModalOpen = true;
+  const metaToggle = document.getElementById("log-meta-toggle");
+  const metaBody = document.getElementById("log-meta-body");
+  if (metaToggle && metaBody) {
+    metaBody.classList.add("collapsed");
+    metaToggle.setAttribute("aria-expanded", "false");
+  }
+  startLogPolling();
+}
+
+function closeLogModal() {
+  const backdrop = document.getElementById("log-modal-backdrop");
+  if (!backdrop) return;
+  backdrop.classList.add("hidden");
+  isLogModalOpen = false;
+  currentLogJobId = null;
+  currentLogEntries = [];
+  stopLogPolling();
+}
+
+function updateLogModal(job) {
+  if (!job) return;
   currentLogEntries = parseJobLogEntries(job)
     .map((entry, index) => ({ ...entry, id: index }))
     .sort((a, b) => {
@@ -1202,56 +1821,79 @@ function openLogModal(job) {
   if (meta) {
     const fileName = getFileName(job.file_path ?? job.new_path ?? "") || "-";
     const initialSize = formatBytes(job.initial_size ?? job.file_size ?? 0);
-    const initialContainer = job.initial_container ?? "-";
+    const initialContainer = normalizeContainerDisplay(job.initial_container ?? "-");
     const initialCodec = job.initial_codec ?? "-";
+    const initialAudio = job.initial_audio_codec ?? "-";
+    const initialSubs = formatSubtitleList(job.initial_subtitles);
+    const initialDuration = formatDurationSeconds(job.initial_duration_sec);
+    const initialFrames = formatFrameCount(job.initial_frame_count);
     const finalSize = job.final_size ? formatBytes(job.final_size) : "-";
-    const finalContainer = job.final_container ?? "-";
+    const finalContainer = normalizeContainerDisplay(job.final_container ?? "-");
     const finalCodec = job.final_codec ?? "-";
+    const finalAudio = job.final_audio_codec ?? "-";
+    const finalSubs = formatSubtitleList(job.final_subtitles);
+    const finalDuration = formatDurationSeconds(job.final_duration_sec);
+    const finalFrames = formatFrameCount(job.final_frame_count);
     const newName = getFileName(job.new_path ?? "") || "-";
 
-    meta.innerHTML = `
-      <div class="log-meta-grid">
-        <div>
-          <div class="muted">Job ID</div>
-          <div>${job.id}</div>
+    const summary = document.getElementById("log-meta-summary");
+    if (summary) {
+      summary.innerHTML = `
+        <div><span class="muted">Job ID:</span> ${job.id}</div>
+        <div><span class="muted">File:</span> ${fileName}</div>
+      `;
+    }
+
+    const body = document.getElementById("log-meta-body");
+    if (body) {
+      body.innerHTML = `
+        <div class="log-meta-grid">
+          <div>
+            <div class="muted">Job ID</div>
+            <div>${job.id}</div>
+          </div>
+          <div>
+            <div class="muted">File</div>
+            <div title="${job.file_path ?? ""}">${fileName}</div>
+          </div>
+          <div>
+            <div class="muted">Type</div>
+            <div>${job.type ?? "-"}</div>
+          </div>
+          <div>
+            <div class="muted">Status</div>
+            <div>${normalizeJobStatus(job.status)}</div>
+          </div>
+          <div>
+            <div class="muted">Initial</div>
+            <div>${initialSize} · ${initialContainer} · ${initialCodec} · ${initialAudio} · ${initialSubs} · ${initialDuration} · ${initialFrames}</div>
+          </div>
+          <div>
+            <div class="muted">Final</div>
+            <div>${finalSize} · ${finalContainer} · ${finalCodec} · ${finalAudio} · ${finalSubs} · ${finalDuration} · ${finalFrames}</div>
+          </div>
+          <div>
+            <div class="muted">New Name</div>
+            <div title="${job.new_path ?? ""}">${newName}</div>
+          </div>
         </div>
-        <div>
-          <div class="muted">File</div>
-          <div title="${job.file_path ?? ""}">${fileName}</div>
-        </div>
-        <div>
-          <div class="muted">Type</div>
-          <div>${job.type ?? "-"}</div>
-        </div>
-        <div>
-          <div class="muted">Status</div>
-          <div>${normalizeJobStatus(job.status)}</div>
-        </div>
-        <div>
-          <div class="muted">Initial</div>
-          <div>${initialSize} · ${initialContainer} · ${initialCodec}</div>
-        </div>
-        <div>
-          <div class="muted">Final</div>
-          <div>${finalSize} · ${finalContainer} · ${finalCodec}</div>
-        </div>
-        <div>
-          <div class="muted">New Name</div>
-          <div title="${job.new_path ?? ""}">${newName}</div>
-        </div>
-      </div>
-    `;
+      `;
+    }
   }
 
   const list = document.getElementById("log-list");
   const content = document.getElementById("log-content");
+  const activeIndex = Number(
+    list?.querySelector(".log-item.active")?.dataset?.logIndex ?? 0
+  );
+
   if (list) {
     list.innerHTML = currentLogEntries
       .map((entry, index) => {
         const tsText = formatLogTimestamp(entry.ts);
         const label = entry.stage ?? "unknown";
         return `
-          <button class="log-item ${index === 0 ? "active" : ""}" data-log-index="${index}">
+          <button class="log-item ${index === activeIndex ? "active" : ""}" data-log-index="${index}">
             <div class="log-item-title">${label}</div>
             <div class="muted log-item-sub">${tsText || ""}</div>
           </button>
@@ -1261,21 +1903,34 @@ function openLogModal(job) {
   }
 
   if (content) {
-    const first = currentLogEntries[0];
-    content.textContent = first?.message ?? "(no log)";
+    const entry = currentLogEntries[activeIndex] ?? currentLogEntries[0];
+    content.innerHTML = renderLogContent(entry?.message ?? "(no log)");
   }
-
-  backdrop.classList.remove("hidden");
-  isLogModalOpen = true;
 }
 
-function closeLogModal() {
-  const backdrop = document.getElementById("log-modal-backdrop");
-  if (!backdrop) return;
-  backdrop.classList.add("hidden");
-  isLogModalOpen = false;
-  currentLogJobId = null;
-  currentLogEntries = [];
+function startLogPolling() {
+  if (logPollTimer) return;
+  logPollTimer = setInterval(async () => {
+    if (!isLogModalOpen || !currentLogJobId) return;
+    try {
+      const job = await fetchJson(`/api/jobs/${currentLogJobId}`);
+      const raw = job?.log_text ?? "";
+      const status = job?.status ?? "";
+      if (raw !== lastLogSnapshot || status !== lastLogStatus) {
+        lastLogSnapshot = raw;
+        lastLogStatus = status;
+        updateLogModal(job);
+      }
+    } catch {
+      // ignore polling errors
+    }
+  }, 1000);
+}
+
+function stopLogPolling() {
+  if (!logPollTimer) return;
+  clearInterval(logPollTimer);
+  logPollTimer = null;
 }
 
 function bindLogModal() {
@@ -1283,6 +1938,8 @@ function bindLogModal() {
   const closeBtn = document.getElementById("log-modal-close");
   const list = document.getElementById("log-list");
   const content = document.getElementById("log-content");
+  const metaToggle = document.getElementById("log-meta-toggle");
+  const metaBody = document.getElementById("log-meta-body");
 
   closeBtn?.addEventListener("click", (event) => {
     event.preventDefault();
@@ -1291,6 +1948,12 @@ function bindLogModal() {
 
   backdrop?.addEventListener("click", (event) => {
     if (event.target === backdrop) closeLogModal();
+  });
+
+  metaToggle?.addEventListener("click", () => {
+    if (!metaBody) return;
+    const isCollapsed = metaBody.classList.toggle("collapsed");
+    metaToggle.setAttribute("aria-expanded", String(!isCollapsed));
   });
 
   list?.addEventListener("click", (event) => {
@@ -1304,14 +1967,184 @@ function bindLogModal() {
       item.classList.toggle("active", item === target);
     });
 
-    content.textContent = entry.message ?? "(no log)";
+    content.innerHTML = renderLogContent(entry.message ?? "(no log)");
   });
+}
+
+function renderLogContent(message) {
+  const text = String(message ?? "");
+  const segments = splitLogSegments(text);
+  const rendered = [];
+  let lineIndex = 0;
+
+  const pushLine = (line) => {
+    if (!String(line ?? "").trim()) {
+      rendered.push(`<div class="log-line empty"></div>`);
+    } else {
+      rendered.push(
+        `<div class="log-line ${lineIndex % 2 ? "odd" : "even"}">${escapeHtml(line)}</div>`
+      );
+    }
+    lineIndex += 1;
+  };
+
+  const pushJson = (json, prefix = "") => {
+    rendered.push(
+      `
+        <div class="log-line ${lineIndex % 2 ? "odd" : "even"}">
+          ${prefix ? `<div class=\"log-json-prefix\">${escapeHtml(prefix)}</div>` : ""}
+          <details class="log-json">
+            <summary>JSON</summary>
+            <pre>${escapeHtml(JSON.stringify(json, null, 2))}</pre>
+          </details>
+        </div>
+      `
+    );
+    lineIndex += 1;
+  };
+
+  segments.forEach((segment) => {
+    if (segment.type === "json") {
+      pushJson(segment.json, segment.prefix);
+      return;
+    }
+    const lines = String(segment.value ?? "").split(/\r?\n/);
+    lines.forEach((line) => pushLine(line));
+  });
+
+  return `<div class="log-content-lines">${rendered.join("")}</div>`;
+}
+
+function safeParseJson(value) {
+  try {
+    const parsed = JSON.parse(value);
+    if (parsed && typeof parsed === "object") return parsed;
+  } catch {
+    // ignore
+  }
+  return null;
+}
+
+function splitLogSegments(text) {
+  const segments = [];
+  const value = String(text ?? "");
+  let cursor = 0;
+  let scanIndex = 0;
+
+  while (scanIndex < value.length) {
+    const startIndex = findJsonStart(value, scanIndex);
+    if (startIndex < 0) {
+      segments.push({ type: "text", value: value.slice(cursor) });
+      break;
+    }
+
+    const block = scanJsonBlockText(value, startIndex);
+    if (!block) {
+      scanIndex = startIndex + 1;
+      continue;
+    }
+
+    const lineStart = value.lastIndexOf("\n", startIndex - 1) + 1;
+    const prefixText = value.slice(lineStart, startIndex);
+    const prefix = prefixText.trim();
+    const prefixHasText = prefix.length > 0;
+    const beforeEnd = prefixHasText ? lineStart : startIndex;
+
+    if (beforeEnd > cursor) {
+      segments.push({ type: "text", value: value.slice(cursor, beforeEnd) });
+    }
+
+    segments.push({ type: "json", json: block.json, prefix: prefixHasText ? prefix : "" });
+    cursor = block.endIndex + 1;
+    scanIndex = cursor;
+  }
+
+  return segments;
+}
+
+function findJsonStart(text, fromIndex) {
+  const isTagPrefix = (idx) => {
+    if (text[idx] !== "[") return false;
+    const lineEnd = text.indexOf("\n", idx);
+    const end = lineEnd === -1 ? text.length : lineEnd;
+    const closeIdx = text.indexOf("]", idx + 1);
+    if (closeIdx === -1 || closeIdx >= end) return false;
+    const label = text.slice(idx + 1, closeIdx).trim();
+    if (!label || /[^a-z0-9_.:-]/i.test(label)) return false;
+    const next = text[closeIdx + 1];
+    return next === " " || next === "\t";
+  };
+
+  for (let i = fromIndex; i < text.length; i += 1) {
+    const ch = text[i];
+    if (ch === "[") {
+      if (isTagPrefix(i)) {
+        const skip = text.indexOf("]", i + 1);
+        i = skip > -1 ? skip : i;
+        continue;
+      }
+      return i;
+    }
+    if (ch === "{") return i;
+  }
+  return -1;
+}
+
+function scanJsonBlockText(text, startIndex) {
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  let started = false;
+  for (let i = startIndex; i < text.length; i += 1) {
+    const ch = text[i];
+    if (escape) {
+      escape = false;
+      continue;
+    }
+    if (ch === "\\") {
+      escape = true;
+      continue;
+    }
+    if (ch === '"') {
+      inString = !inString;
+      continue;
+    }
+    if (inString) continue;
+
+    if (ch === "{" || ch === "[") {
+      depth += 1;
+      started = true;
+    } else if (ch === "}" || ch === "]") {
+      depth -= 1;
+    }
+
+    if (started && depth === 0) {
+      const raw = text.slice(startIndex, i + 1);
+      const parsed = safeParseJson(raw.trim());
+      if (parsed) {
+        return { json: parsed, endIndex: i };
+      }
+      return null;
+    }
+  }
+  return null;
+}
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/\"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 function bindLibraryModal(libs) {
   const backdrop = document.getElementById("library-modal-backdrop");
   const closeBtn = document.getElementById("library-modal-close");
   const form = document.getElementById("library-form");
+  const allowlist = document.getElementById("tree-allowlist");
+  const scopeField = form?.elements?.treeScope;
 
   closeBtn?.addEventListener("click", (event) => {
     event.preventDefault();
@@ -1323,7 +2156,8 @@ function bindLibraryModal(libs) {
 
   form?.addEventListener("submit", async (event) => {
     event.preventDefault();
-    const data = Object.fromEntries(new FormData(form).entries());
+    const formData = new FormData(form);
+    const data = Object.fromEntries(formData.entries());
     const includeExtensions = data.includeExtensions
       ? data.includeExtensions.split(/[,\s]+/).filter(Boolean)
       : undefined;
@@ -1332,6 +2166,8 @@ function bindLibraryModal(libs) {
       : undefined;
     const nodes = data.nodes ? data.nodes.split(/[,\s]+/).filter(Boolean) : undefined;
     const scanIntervalMin = data.scanIntervalMin ? Number(data.scanIntervalMin) : undefined;
+    const treeScope = data.treeScope ?? "selected";
+    const allowedTrees = treeScope === "selected" ? formData.getAll("allowedTrees") : [];
 
     const payload = {
       name: data.name,
@@ -1340,6 +2176,8 @@ function bindLibraryModal(libs) {
       excludeExtensions,
       nodes,
       scanIntervalMin,
+      treeScope,
+      allowedTrees,
     };
 
     if (data.libraryId) {
@@ -1360,6 +2198,11 @@ function bindLibraryModal(libs) {
     await renderLibraries();
   });
 
+  scopeField?.addEventListener("change", () => {
+    const isSelected = scopeField.value !== "any";
+    allowlist?.classList.toggle("hidden", !isSelected);
+  });
+
   const expanded = Array.from(expandedLibraries);
   for (const libId of expanded) {
     const page = libraryFilesPage.get(libId) ?? 0;
@@ -1378,6 +2221,27 @@ function renderTreeModal() {
         <form class="form" id="tree-form">
           <input name="name" placeholder="Tree name" required />
           <textarea name="description" placeholder="Description"></textarea>
+          <label class="field-label">Processing support</label>
+          <select name="requiredProcessing">
+            <option value="any">Any (CPU/GPU)</option>
+            <option value="cpu">CPU only</option>
+            <option value="gpu">GPU only</option>
+          </select>
+          <label class="field-label">Supported accelerators (any)</label>
+          <div class="checkbox-group">
+            <label><input type="checkbox" name="requiredAccelerators" value="cpu" /> CPU</label>
+            <label><input type="checkbox" name="requiredAccelerators" value="nvidia" /> NVIDIA</label>
+            <label><input type="checkbox" name="requiredAccelerators" value="intel" /> Intel</label>
+            <label><input type="checkbox" name="requiredAccelerators" value="amd" /> AMD</label>
+          </div>
+          <div class="field-hint">If multiple are checked, any matching accelerator is allowed.</div>
+          <label class="field-label">Node tags (all required)</label>
+          <input name="requiredTagsAll" placeholder="e.g. h265, hdr" />
+          <label class="field-label">Node tags (any required)</label>
+          <input name="requiredTagsAny" placeholder="e.g. nvidia, intel" />
+          <label class="field-label">Node tags (must be absent)</label>
+          <input name="requiredTagsNone" placeholder="e.g. lowpower" />
+          <div class="field-hint">Tags are CSV values set on the node config.</div>
           <input type="hidden" name="treeId" />
           <button class="primary" type="submit">Save</button>
         </form>
@@ -1434,10 +2298,16 @@ function openTreeSettingsModal(node) {
   const error = document.getElementById("tree-settings-error");
   if (!backdrop || !form || !title) return;
 
-  const elementType = node?.data?.elementType ?? "unknown";
-  const def = getElementDef(elementType);
-  title.textContent = `Settings: ${node?.data?.label ?? elementType}`;
-  form.dataset.nodeId = node.id;
+  const elementType = node?.data?.elementType ?? node?.elementType ?? "unknown";
+  const def = getElementDef(elementType) ?? {
+    type: elementType,
+    label: node?.data?.label ?? elementType,
+    source: "built-in",
+    fields: [],
+  };
+  const nodeId = node?.id ?? node?.data?.__nodeId ?? node?.nodeId ?? "";
+  title.textContent = `Settings: ${node?.data?.label ?? def.label ?? elementType}`;
+  form.dataset.nodeId = nodeId;
 
   const config = node?.data?.config ?? {};
   form.innerHTML = buildSettingsFields(def, config);
@@ -1462,6 +2332,65 @@ function openTreeSettingsModal(node) {
   isTreeModalOpen = true;
 }
 
+function ensureTreeNodeMenu() {
+  let menu = document.getElementById("tree-node-menu");
+  if (menu) return menu;
+  menu = document.createElement("div");
+  menu.id = "tree-node-menu";
+  menu.className = "tree-context-menu hidden";
+  menu.innerHTML = `
+    <button class="ghost" data-action="config">Configure</button>
+    <button class="danger" data-action="delete">Delete</button>
+  `;
+  document.body.appendChild(menu);
+
+  menu.addEventListener("click", (event) => {
+    const action = event.target.closest("button")?.dataset.action;
+    if (!action || !treeNodeMenuState.node) return;
+    if (action === "config") {
+      openTreeSettingsModal(treeNodeMenuState.node);
+      closeTreeNodeMenu();
+      return;
+    }
+    if (action === "delete") {
+      const nodeId = treeNodeMenuState.node?.id ?? treeNodeMenuState.node?.data?.__nodeId;
+      if (nodeId && typeof treeDesignerState.deleteNode === "function") {
+        treeDesignerState.deleteNode(nodeId);
+      }
+      closeTreeNodeMenu();
+    }
+  });
+
+  document.addEventListener("click", (event) => {
+    if (!menu.classList.contains("hidden") && !menu.contains(event.target)) {
+      closeTreeNodeMenu();
+    }
+  });
+
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") closeTreeNodeMenu();
+  });
+
+  return menu;
+}
+
+function openTreeNodeMenu(position, node) {
+  const menu = ensureTreeNodeMenu();
+  const x = Math.max(8, position.x ?? 0);
+  const y = Math.max(8, position.y ?? 0);
+  menu.style.left = `${x}px`;
+  menu.style.top = `${y}px`;
+  menu.classList.remove("hidden");
+  treeNodeMenuState.node = node;
+}
+
+function closeTreeNodeMenu() {
+  const menu = document.getElementById("tree-node-menu");
+  if (!menu) return;
+  menu.classList.add("hidden");
+  treeNodeMenuState.node = null;
+}
+
 function closeTreeSettingsModal() {
   const backdrop = document.getElementById("tree-settings-backdrop");
   if (!backdrop) return;
@@ -1483,7 +2412,7 @@ function bindTreeSettingsModal() {
     if (event.target === backdrop) closeTreeSettingsModal();
   });
 
-  form?.addEventListener("submit", (event) => {
+  form?.addEventListener("submit", async (event) => {
     event.preventDefault();
     const nodeId = form.dataset.nodeId;
     if (!nodeId || typeof treeDesignerState.updateNodeConfig !== "function") return;
@@ -1503,7 +2432,7 @@ function bindTreeSettingsModal() {
       error.textContent = "";
       error.classList.add("hidden");
     }
-    treeDesignerState.updateNodeConfig(nodeId, config);
+    treeDesignerState.updateNodeConfig(nodeId, config, { autoSave: true });
     closeTreeSettingsModal();
   });
 }
@@ -1514,11 +2443,16 @@ function buildSettingsFields(def, config) {
   fields.push(`<input type="hidden" name="elementType" value="${elementType}" />`);
 
   const fieldDefs = def?.fields ?? [];
-  fieldDefs.forEach((field) => {
+  fieldDefs.forEach((field, index) => {
     const label = field.label ?? field.key;
-    const name = field.key;
+    const name = field.name ?? field.key;
     const placeholder = field.placeholder ?? "";
     const type = field.type ?? "text";
+    const suggestions = Array.isArray(field.suggestions) ? field.suggestions : [];
+    const fieldId = `field-${elementType}-${name.replace(/[^a-z0-9_-]/gi, "-")}-${index}`;
+    const listId = suggestions.length
+      ? `suggest-${elementType}-${name.replace(/[^a-z0-9_-]/gi, "-")}`
+      : null;
     const current = getConfigValue(config, field.path ?? field.key, field.default);
     const value = type === "json"
       ? JSON.stringify(current ?? field.default ?? {}, null, 2)
@@ -1527,19 +2461,31 @@ function buildSettingsFields(def, config) {
           ? current.join("\n")
           : current ?? ""
         : current ?? "";
-    fields.push(`<label class="muted">${label}</label>`);
+    fields.push(`<label class="muted" for="${fieldId}">${label}</label>`);
     if (field.description) {
       fields.push(`<div class="muted" style="font-size:12px;">${field.description}</div>`);
     }
-    if (type === "textarea" || type === "json") {
+    if (type === "checkbox" || type === "boolean") {
+      const checked = Boolean(current ?? field.default ?? false);
       fields.push(
-        `<textarea name="${name}" placeholder="${placeholder}" rows="4">${value ?? ""}</textarea>`
+        `<input id="${fieldId}" name="${name}" type="checkbox"${checked ? " checked" : ""} />`
+      );
+    } else if (type === "textarea" || type === "json") {
+      fields.push(
+        `<textarea id="${fieldId}" name="${name}" placeholder="${placeholder}" rows="4">${value ?? ""}</textarea>`
       );
     } else {
       const inputType = type === "number" ? "number" : "text";
       fields.push(
-        `<input name="${name}" type="${inputType}" value="${value ?? ""}" placeholder="${placeholder}" />`
+        `<input id="${fieldId}" name="${name}" type="${inputType}" value="${value ?? ""}" placeholder="${placeholder}"${listId ? ` list="${listId}"` : ""} />`
       );
+      if (listId) {
+        fields.push(
+          `<datalist id="${listId}">` +
+            suggestions.map((item) => `<option value="${item}"></option>`).join("") +
+          `</datalist>`
+        );
+      }
     }
   });
 
@@ -1558,7 +2504,8 @@ function parseSettingsConfig(def, data) {
 
   fieldDefs.forEach((field) => {
     const key = field.key;
-    const raw = data[key];
+    const name = field.name ?? key;
+    const raw = data[name] ?? data[key];
     const label = field.label ?? key;
     const type = field.type ?? "text";
     const path = field.path ?? key;
@@ -1572,7 +2519,10 @@ function parseSettingsConfig(def, data) {
     }
 
     if (raw === undefined || raw === "") {
-      if (field.default !== undefined) {
+      if (type === "checkbox" || type === "boolean") {
+        const fallback = field.default !== undefined ? field.default : false;
+        setDeepValue(config, path, Boolean(fallback));
+      } else if (field.default !== undefined) {
         setDeepValue(config, path, field.default);
       }
       return;
@@ -1585,6 +2535,11 @@ function parseSettingsConfig(def, data) {
         return;
       }
       setDeepValue(config, path, num);
+      return;
+    }
+
+    if (type === "checkbox" || type === "boolean") {
+      setDeepValue(config, path, true);
       return;
     }
 
@@ -1639,6 +2594,9 @@ function parseSettingsConfig(def, data) {
 function getConfigValue(config, path, fallback) {
   if (!config) return fallback;
   if (!path) return fallback;
+  if (Object.prototype.hasOwnProperty.call(config, path)) {
+    return config[path] ?? fallback;
+  }
   const segments = path.split(".");
   let current = config;
   for (const segment of segments) {
@@ -1685,6 +2643,14 @@ function openTreeModal(tree) {
   form.elements.treeId.value = tree?.id ?? "";
   form.elements.name.value = tree?.name ?? "";
   form.elements.description.value = tree?.description ?? "";
+  form.elements.requiredProcessing.value = tree?.required_processing ?? "any";
+  const requiredAccels = parseJsonList(tree?.required_accelerators);
+  Array.from(form.querySelectorAll("input[name='requiredAccelerators']")).forEach((input) => {
+    input.checked = requiredAccels.includes(input.value);
+  });
+  form.elements.requiredTagsAll.value = parseJsonList(tree?.required_tags_all).join(", ");
+  form.elements.requiredTagsAny.value = parseJsonList(tree?.required_tags_any).join(", ");
+  form.elements.requiredTagsNone.value = parseJsonList(tree?.required_tags_none).join(", ");
 }
 
 function closeTreeModal() {
@@ -1710,18 +2676,46 @@ function bindTreeModal() {
 
   form?.addEventListener("submit", async (event) => {
     event.preventDefault();
-    const data = Object.fromEntries(new FormData(form).entries());
+    const formData = new FormData(form);
+    const data = Object.fromEntries(formData.entries());
+    const requiredAccelerators = formData.getAll("requiredAccelerators");
+    const requiredProcessing = data.requiredProcessing ?? "any";
+    const requiredTagsAll = data.requiredTagsAll
+      ? data.requiredTagsAll.split(/[\,\s]+/).filter(Boolean)
+      : [];
+    const requiredTagsAny = data.requiredTagsAny
+      ? data.requiredTagsAny.split(/[\,\s]+/).filter(Boolean)
+      : [];
+    const requiredTagsNone = data.requiredTagsNone
+      ? data.requiredTagsNone.split(/[\,\s]+/).filter(Boolean)
+      : [];
     if (data.treeId) {
       await fetch(`/api/trees/${data.treeId}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: data.name, description: data.description }),
+        body: JSON.stringify({
+          name: data.name,
+          description: data.description,
+          requiredAccelerators,
+          requiredProcessing,
+          requiredTagsAll,
+          requiredTagsAny,
+          requiredTagsNone,
+        }),
       });
     } else {
       await fetch("/api/trees", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: data.name, description: data.description }),
+        body: JSON.stringify({
+          name: data.name,
+          description: data.description,
+          requiredAccelerators,
+          requiredProcessing,
+          requiredTagsAll,
+          requiredTagsAny,
+          requiredTagsNone,
+        }),
       });
     }
 
@@ -1829,7 +2823,17 @@ function mountTreeDesigner(tree) {
       "div",
       {
         className: "tree-node",
+        "data-node-id": id,
+        "data-element-type": elementType ?? "custom",
+        "data-label": data?.label ?? "Node",
         onDoubleClick: () => openTreeSettingsModal({ id, data }),
+        onMouseDown: (event) => {
+          if (event.detail === 2) openTreeSettingsModal({ id, data });
+        },
+        onContextMenu: (event) => {
+          event.preventDefault();
+          openTreeNodeMenu({ x: event.clientX, y: event.clientY }, { id, data });
+        },
       },
       React.createElement("div", { className: "tree-node-title" }, data?.label ?? "Node"),
       React.createElement(
@@ -1862,13 +2866,48 @@ function mountTreeDesigner(tree) {
     const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
     const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
     const [dirty, setDirty] = React.useState(false);
-    const { project } = useReactFlow();
+    const { screenToFlowPosition } = useReactFlow();
+    const lastClickRef = React.useRef({ nodeId: null, time: 0 });
+    const lastPointerRef = React.useRef({ nodeId: null, time: 0 });
 
     React.useEffect(() => {
       setNodes(initialNodes);
       setEdges(initialEdges);
       setDirty(false);
     }, [tree?.id]);
+
+    React.useEffect(() => {
+      treeDesignerState.getNode = (nodeId) => nodes.find((node) => node.id === nodeId);
+    }, [nodes]);
+
+    React.useEffect(() => {
+      const pointerHandler = (event) => {
+        const target = event.target.closest(".tree-node");
+        if (!target) return;
+        const nodeId = target.dataset.nodeId;
+        if (!nodeId) return;
+        const now = Date.now();
+        const last = lastPointerRef.current;
+        if (last.nodeId === nodeId && now - last.time < 350) {
+          const node =
+            treeDesignerState.getNode?.(nodeId) ?? {
+              id: nodeId,
+              data: {
+                elementType: target.dataset.elementType ?? "custom",
+                label: target.dataset.label ?? "Node",
+              },
+            };
+          openTreeSettingsModal(node);
+          lastPointerRef.current = { nodeId: null, time: 0 };
+          return;
+        }
+        lastPointerRef.current = { nodeId, time: now };
+      };
+      document.addEventListener("pointerdown", pointerHandler, true);
+      return () => {
+        document.removeEventListener("pointerdown", pointerHandler, true);
+      };
+    }, [nodes]);
 
     const onNodesChangeWithDirty = React.useCallback(
       (changes) => {
@@ -1913,6 +2952,7 @@ function mountTreeDesigner(tree) {
             elementType: def.type,
             outputs: def.outputs,
             context: {},
+            __nodeId: id,
           },
         },
       ]);
@@ -1924,14 +2964,13 @@ function mountTreeDesigner(tree) {
         event.preventDefault();
         const elementType = event.dataTransfer.getData("application/reactflow");
         if (!elementType) return;
-        const bounds = event.currentTarget.getBoundingClientRect();
-        const position = project({
-          x: event.clientX - bounds.left,
-          y: event.clientY - bounds.top,
+        const position = screenToFlowPosition({
+          x: event.clientX,
+          y: event.clientY,
         });
         addNode(elementType, position);
       },
-      [project]
+      [screenToFlowPosition]
     );
 
     const onDragOver = React.useCallback((event) => {
@@ -1944,15 +2983,47 @@ function mountTreeDesigner(tree) {
     }, []);
 
     const onNodeClick = React.useCallback((event, node) => {
-      if (event.detail === 2) {
+      const now = Date.now();
+      const last = lastClickRef.current;
+      if (last.nodeId === node.id && now - last.time < 350) {
         openTreeSettingsModal(node);
+        lastClickRef.current = { nodeId: null, time: 0 };
+        return;
       }
+      lastClickRef.current = { nodeId: node.id, time: now };
     }, []);
 
+    const onNodeContextMenu = React.useCallback((event, node) => {
+      event.preventDefault();
+      openTreeNodeMenu({ x: event.clientX, y: event.clientY }, node);
+    }, []);
+
+    const saveGraph = React.useCallback(
+      async (graphNodes, graphEdges) => {
+        if (!tree?.id) return;
+        const graph = { version: 1, nodes: graphNodes, edges: graphEdges };
+        const res = await fetch(`/api/trees/${tree.id}/versions`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ graph }),
+        });
+        if (!res.ok) {
+          const message = await res.text();
+          alert(`Save failed: ${message || res.status}`);
+          return false;
+        }
+        setDirty(false);
+        pendingTreeId = tree.id;
+        await renderTrees();
+        return true;
+      },
+      [tree?.id]
+    );
+
     const updateNodeConfig = React.useCallback(
-      (nodeId, config) => {
-        setNodes((nds) =>
-          nds.map((n) =>
+      (nodeId, config, options = {}) => {
+        setNodes((nds) => {
+          const nextNodes = nds.map((n) =>
             n.id === nodeId
               ? {
                   ...n,
@@ -1962,23 +3033,32 @@ function mountTreeDesigner(tree) {
                   },
                 }
               : n
-          )
-        );
+          );
+          if (options.autoSave) {
+            void saveGraph(nextNodes, edges);
+          } else {
+            setDirty(true);
+          }
+          return nextNodes;
+        });
+        if (!options.autoSave) {
+          setDirty(true);
+        }
+      },
+      [setNodes, edges, saveGraph]
+    );
+
+    const deleteNode = React.useCallback(
+      (nodeId) => {
+        setNodes((nds) => nds.filter((n) => n.id !== nodeId));
+        setEdges((eds) => eds.filter((e) => e.source !== nodeId && e.target !== nodeId));
         setDirty(true);
       },
-      [setNodes]
+      [setNodes, setEdges]
     );
 
     const save = async () => {
-      if (!tree?.id) return;
-      const graph = { version: 1, nodes, edges };
-      await fetch(`/api/trees/${tree.id}/versions`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ graph }),
-      });
-      setDirty(false);
-      await renderTrees();
+      await saveGraph(nodes, edges);
     };
 
     React.useEffect(() => {
@@ -1986,12 +3066,13 @@ function mountTreeDesigner(tree) {
       treeDesignerState.save = save;
       treeDesignerState.isDirty = dirty;
       treeDesignerState.updateNodeConfig = updateNodeConfig;
+      treeDesignerState.deleteNode = deleteNode;
       const saveBtn = document.getElementById("tree-designer-save");
       if (saveBtn) {
         saveBtn.disabled = !treeDesignerState.treeId || !dirty;
         saveBtn.textContent = dirty ? "Save changes" : "Saved";
       }
-    }, [dirty, tree?.id]);
+    }, [dirty, tree?.id, updateNodeConfig, deleteNode]);
 
     return React.createElement(
       "div",
@@ -2020,8 +3101,13 @@ function mountTreeDesigner(tree) {
               onDragOver,
               onNodeDoubleClick,
               onNodeClick,
+              onNodeContextMenu,
               nodeTypes: { treeNode: TreeNode },
+              defaultEdgeOptions: { type: "step" },
               fitView: true,
+              zoomOnDoubleClick: false,
+              nodeDragThreshold: 6,
+              nodeClickDistance: 6,
             },
             React.createElement(Background, { gap: 16 }),
             React.createElement(Controls),
@@ -2031,7 +3117,7 @@ function mountTreeDesigner(tree) {
         React.createElement(
           "div",
           { className: "tree-designer-palette" },
-          TREE_ELEMENT_DEFS.map((item) =>
+          TREE_ELEMENT_DEFS.filter((item) => !item.debugOnly || appConfig?.debug).map((item) =>
             React.createElement(
               "div",
               {
@@ -2070,7 +3156,22 @@ function parseJsonList(value) {
   }
 }
 
-checkHealth();
-renderSidebarLists();
-renderDashboard();
-startAutoRefresh();
+async function bootUi() {
+  checkHealth();
+  await loadAppConfig();
+  try {
+    await renderSidebarLists();
+  } catch (err) {
+    console.warn("Sidebar load failed:", err.message ?? err);
+    showLoadError("Sidebar data not available yet.");
+  }
+  try {
+    await renderDashboard();
+  } catch (err) {
+    console.warn("Dashboard load failed:", err.message ?? err);
+    showLoadError("Dashboard data not available yet.");
+  }
+  startAutoRefresh();
+}
+
+bootUi();

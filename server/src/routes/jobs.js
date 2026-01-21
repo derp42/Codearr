@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { nextJobs, completeJob, updateJobProgress, reenqueueByStatus } from "../services/queue.js";
+import { nextJobs, completeJob, updateJobProgress, reenqueueByStatus, requeueJob } from "../services/queue.js";
 import { scanLibrary } from "../services/scanner.js";
 
 export function createJobsRouter(db) {
@@ -16,10 +16,12 @@ export function createJobsRouter(db) {
     const limit = Math.min(Number(req.query.limit ?? 200), 1000);
     const jobs = db
       .prepare(
-        `SELECT j.id, j.file_id, j.type, j.status, j.assigned_node_id, j.progress, j.processing_type, j.accelerator,
+        `SELECT j.id, j.file_id, j.type, j.status, j.assigned_node_id, j.progress, j.progress_message, j.processing_type, j.accelerator,
                 j.created_at, j.updated_at, j.log_text, j.transcode_payload,
                 f.path AS file_path, f.size AS file_size, f.initial_size, f.initial_container, f.initial_codec,
-                f.final_size, f.final_container, f.final_codec, f.new_path
+                f.initial_audio_codec, f.initial_subtitles, f.initial_duration_sec, f.initial_frame_count,
+                f.final_size, f.final_container, f.final_codec,
+                f.final_audio_codec, f.final_subtitles, f.final_duration_sec, f.final_frame_count, f.new_path
          FROM jobs j
          LEFT JOIN files f ON f.id = j.file_id
          ORDER BY j.created_at DESC
@@ -30,10 +32,16 @@ export function createJobsRouter(db) {
   });
 
   router.post("/next", (req, res) => {
-    const { nodeId, slots, accelerators } = req.body;
+    const { nodeId, slots, accelerators, allowTranscode } = req.body;
     if (!nodeId) return res.status(400).json({ error: "nodeId required" });
 
-    const jobs = nextJobs(db, nodeId, slots ?? { cpu: 1, gpu: 0 }, accelerators ?? []);
+    const jobs = nextJobs(
+      db,
+      nodeId,
+      slots ?? { cpu: 1, gpu: 0 },
+      accelerators ?? [],
+      { allowTranscode: allowTranscode !== false }
+    );
     if (!jobs.length) return res.json({ job: null, jobs: [] });
     if (!slots) return res.json({ job: jobs[0] });
     res.json({ jobs });
@@ -42,7 +50,7 @@ export function createJobsRouter(db) {
   router.post("/progress", (req, res) => {
     const { jobId, progress, stage, log } = req.body;
     if (!jobId) return res.status(400).json({ error: "jobId required" });
-    updateJobProgress(db, jobId, progress);
+    updateJobProgress(db, jobId, progress, log);
     if (log) {
       const entry = JSON.stringify({
         ts: new Date().toISOString(),
@@ -67,9 +75,17 @@ export function createJobsRouter(db) {
       "initial_size",
       "initial_container",
       "initial_codec",
+      "initial_audio_codec",
+      "initial_subtitles",
+      "initial_duration_sec",
+      "initial_frame_count",
       "final_size",
       "final_container",
       "final_codec",
+      "final_audio_codec",
+      "final_subtitles",
+      "final_duration_sec",
+      "final_frame_count",
       "new_path",
     ]);
 
@@ -88,7 +104,7 @@ export function createJobsRouter(db) {
     }
 
     if (typeof progress === "number") {
-      updateJobProgress(db, jobId, progress);
+      updateJobProgress(db, jobId, progress, log);
     }
 
     if (log) {
@@ -121,6 +137,14 @@ export function createJobsRouter(db) {
     res.json({ ok: true });
   });
 
+  router.post("/requeue", (req, res) => {
+    const { jobId, targetType } = req.body;
+    if (!jobId) return res.status(400).json({ error: "jobId required" });
+    const ok = requeueJob(db, jobId, targetType);
+    if (!ok) return res.status(404).json({ error: "job not found" });
+    res.json({ ok: true });
+  });
+
   router.post("/reset", (req, res) => {
     db.prepare("DELETE FROM jobs").run();
     db.prepare("UPDATE files SET status = 'indexed', updated_at = ?").run(
@@ -133,6 +157,26 @@ export function createJobsRouter(db) {
       });
     });
     res.json({ ok: true });
+  });
+
+  router.get("/:id", (req, res) => {
+    const { id } = req.params;
+    const job = db
+      .prepare(
+        `SELECT j.id, j.file_id, j.type, j.status, j.assigned_node_id, j.progress, j.progress_message, j.processing_type, j.accelerator,
+                j.created_at, j.updated_at, j.log_text, j.transcode_payload,
+                f.path AS file_path, f.size AS file_size, f.initial_size, f.initial_container, f.initial_codec,
+                f.initial_audio_codec, f.initial_subtitles, f.initial_duration_sec, f.initial_frame_count,
+                f.final_size, f.final_container, f.final_codec,
+                f.final_audio_codec, f.final_subtitles, f.final_duration_sec, f.final_frame_count, f.new_path
+         FROM jobs j
+         LEFT JOIN files f ON f.id = j.file_id
+         WHERE j.id = ?`
+      )
+      .get(id);
+
+    if (!job) return res.status(404).json({ error: "job not found" });
+    res.json(job);
   });
 
   return router;

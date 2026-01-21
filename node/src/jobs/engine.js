@@ -50,6 +50,109 @@ async function runCommand(command, args, { onStdout, onStderr } = {}) {
   });
 }
 
+function parseArgs(value) {
+  if (!value) return [];
+  return String(value)
+    .split(/\s+/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+}
+
+function getHealthcheckArgs(processingType, accelerator, gpuInfo) {
+  if (String(processingType ?? "cpu").toLowerCase() !== "gpu") {
+    return parseArgs(config.healthcheckArgsAny);
+  }
+
+  const accel = String(accelerator ?? "").toLowerCase();
+  const vendor = String(gpuInfo?.vendor ?? "").toLowerCase();
+  const model = String(gpuInfo?.model ?? "").toLowerCase();
+
+  if (accel.includes("nvenc") || accel.includes("nvidia") || vendor.includes("nvidia")) {
+    return parseArgs(config.healthcheckArgsNvenc);
+  }
+  if (accel.includes("qsv") || accel.includes("intel") || vendor.includes("intel") || model.includes("intel")) {
+    return parseArgs(config.healthcheckArgsQsv);
+  }
+  if (accel.includes("vaapi") || accel.includes("amd") || vendor.includes("amd") || vendor.includes("advanced micro devices") || model.includes("radeon")) {
+    return parseArgs(config.healthcheckArgsVaapi);
+  }
+  return parseArgs(config.healthcheckArgsAny);
+}
+
+async function runFfmpegValidation(
+  inputPath,
+  processingType,
+  accelerator,
+  gpuIndex,
+  gpuInfo,
+  { onLog, onProgress } = {}
+) {
+  if (!config.ffmpegPath) {
+    throw new Error("ffmpeg not available (CODARR_FFMPEG_PATH not set)");
+  }
+
+  return new Promise((resolve) => {
+    const args = [...getHealthcheckArgs(processingType, accelerator, gpuInfo)];
+    if (gpuIndex != null && Number.isFinite(Number(gpuIndex)) && args.includes("-hwaccel")) {
+      args.push("-hwaccel_device", String(gpuIndex));
+    }
+    args.push("-nostdin", "-i", inputPath, "-f", "null", "-");
+    const child = spawn(config.ffmpegPath, args, { stdio: ["ignore", "ignore", "pipe"] });
+    let stderr = "";
+    let buffer = "";
+
+    let hasError = false;
+    let lastErrorLine = "";
+
+    child.stderr.on("data", (chunk) => {
+      const text = chunk.toString();
+      buffer += text;
+
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop() ?? "";
+
+      lines.forEach((line) => {
+        const trimmed = line.trim();
+        if (!trimmed) return;
+        const suppressed = isFfmpegSuppressedLine(trimmed);
+        if (!suppressed) {
+          stderr += `${trimmed}\n`;
+          onLog?.(trimmed);
+        }
+        if (!suppressed && isFfmpegErrorLine(trimmed)) {
+          hasError = true;
+          lastErrorLine = trimmed;
+        }
+        const progress = parseFfmpegStatsLine(trimmed);
+        if (progress) onProgress?.(progress);
+      });
+    });
+
+    child.on("close", (code) => {
+      const tail = buffer.trim();
+      if (tail) {
+        const suppressed = isFfmpegSuppressedLine(tail);
+        if (!suppressed) {
+          stderr += `${tail}\n`;
+          onLog?.(tail);
+        }
+        if (!suppressed && isFfmpegErrorLine(tail)) {
+          hasError = true;
+          lastErrorLine = tail;
+        }
+        const progress = parseFfmpegStatsLine(tail);
+        if (progress) onProgress?.(progress);
+      }
+      resolve({ code: code ?? 0, stderr: stderr.trim(), hasError, lastErrorLine });
+    });
+
+    child.on("error", (error) => {
+      const message = String(error?.message ?? error);
+      resolve({ code: 1, stderr: message, hasError: true, lastErrorLine: message });
+    });
+  });
+}
+
 async function ffprobeFile(filePath) {
   if (!config.ffprobePath) {
     throw new Error("ffprobe not available (CODARR_FFPROBE_PATH not set)");
@@ -78,37 +181,161 @@ async function ffprobeFile(filePath) {
 
   const videoStream = streams.find((s) => s.codec_type === "video");
   const audioStream = streams.find((s) => s.codec_type === "audio");
+  const subtitleStreams = streams.filter((s) => s.codec_type === "subtitle");
 
-  const container = String(format.format_name ?? "").split(",")[0] || null;
+  const rawContainer = String(format.format_name ?? "").split(",")[0] || null;
+  const container = normalizeContainer(rawContainer);
   const videoCodec = videoStream?.codec_name ?? null;
   const audioCodec = audioStream?.codec_name ?? null;
+  const subtitleCodecs = subtitleStreams
+    .map((s) => s.codec_name)
+    .filter(Boolean);
+
+  const durationSec = parseNumber(format.duration);
+  const frameCount = extractFrameCount(videoStream, durationSec);
+
+  if (!streams.length || (!videoCodec && !audioCodec && !container)) {
+    throw new Error("Invalid media file (no streams detected)");
+  }
 
   return {
     container,
     videoCodec,
     audioCodec,
+    subtitleCodecs,
+    durationSec,
+    frameCount,
     streams,
     format,
   };
+}
+
+function parseNumber(value) {
+  const num = Number(value);
+  return Number.isFinite(num) ? num : null;
+}
+
+function parseFrameRate(rateValue) {
+  if (!rateValue) return null;
+  if (typeof rateValue === "number") return Number.isFinite(rateValue) ? rateValue : null;
+  const raw = String(rateValue);
+  if (!raw.includes("/")) {
+    const parsed = Number(raw);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  const [num, den] = raw.split("/").map((part) => Number(part));
+  if (!Number.isFinite(num) || !Number.isFinite(den) || den === 0) return null;
+  return num / den;
+}
+
+function extractFrameCount(videoStream, durationSec) {
+  if (videoStream?.nb_frames != null) {
+    const parsed = Number(videoStream.nb_frames);
+    if (Number.isFinite(parsed)) return Math.round(parsed);
+  }
+  const streamDuration = parseNumber(videoStream?.duration);
+  const duration = Number.isFinite(streamDuration) ? streamDuration : durationSec;
+  const fps = parseFrameRate(videoStream?.avg_frame_rate) ?? parseFrameRate(videoStream?.r_frame_rate);
+  if (duration != null && fps != null) {
+    return Math.round(duration * fps);
+  }
+  return null;
+}
+
+function parseFfmpegStatsLine(line) {
+  if (!line.startsWith("frame=") && !line.includes(" time=")) return null;
+  const frameMatch = line.match(/frame=\s*(\d+)/i);
+  const fpsMatch = line.match(/fps=\s*([0-9.]+)/i);
+  const timeMatch = line.match(/time=\s*([0-9:.]+)/i);
+
+  const frame = frameMatch ? Number(frameMatch[1]) : null;
+  const fps = fpsMatch ? Number(fpsMatch[1]) : null;
+  const timeSec = timeMatch ? parseFfmpegTime(timeMatch[1]) : null;
+
+  const parts = [];
+  if (Number.isFinite(frame)) parts.push(`frame=${frame}`);
+  if (Number.isFinite(fps)) parts.push(`fps=${fps}`);
+  if (Number.isFinite(timeSec)) parts.push(`time=${timeSec.toFixed(2)}s`);
+
+  return {
+    frame: Number.isFinite(frame) ? frame : null,
+    fps: Number.isFinite(fps) ? fps : null,
+    timeSec: Number.isFinite(timeSec) ? timeSec : null,
+    message: parts.join(" "),
+  };
+}
+
+function isFfmpegErrorLine(line) {
+  if (isFfmpegSuppressedLine(line)) return false;
+  const lower = line.toLowerCase();
+  if (lower.includes("error")) return true;
+  if (lower.includes("failed")) return true;
+  if (lower.includes("invalid")) return true;
+  if (lower.includes("no such file or directory")) return true;
+  if (lower.includes("permission denied")) return true;
+  return false;
+}
+
+function isFfmpegSuppressedLine(line) {
+  const lower = line.toLowerCase();
+  if (lower.includes("non monotonically increasing dts")) return true;
+  return false;
+}
+
+function parseFfmpegTime(value) {
+  const raw = String(value ?? "").trim();
+  if (!raw) return null;
+  const parts = raw.split(":").map((v) => Number(v));
+  if (parts.some((v) => Number.isNaN(v))) return null;
+  if (parts.length === 3) {
+    const [h, m, s] = parts;
+    return h * 3600 + m * 60 + s;
+  }
+  if (parts.length === 2) {
+    const [m, s] = parts;
+    return m * 60 + s;
+  }
+  if (parts.length === 1) {
+    return parts[0];
+  }
+  return null;
+}
+
+function normalizeContainer(value) {
+  const raw = String(value ?? "").toLowerCase();
+  if (!raw) return null;
+  const parts = raw.split(",").map((part) => part.trim()).filter(Boolean);
+  const has = (name) => parts.includes(name);
+  if (has("webm")) return "webm";
+  if (has("matroska")) return "mkv";
+  if (has("mp4")) return "mp4";
+  if (has("mov") || has("quicktime")) return "mov";
+  if (has("mpegts")) return "ts";
+  if (has("avi")) return "avi";
+  return parts[0] ?? null;
 }
 
 function resolveOutputPath(inputPath, container) {
   const ext = container ? `.${container}` : path.extname(inputPath) || ".mkv";
   const dir = path.dirname(inputPath);
   const base = path.basename(inputPath, path.extname(inputPath));
-  return path.join(dir, `${base}.codarr.transcode${ext}`);
+  return path.join(dir, `${base}.transcoded${ext}`);
 }
 
-async function runFfmpeg({ inputPath, outputPath, data, log }) {
+async function runFfmpeg({ inputPath, outputPath, data, log, onProgress, onCommand } = {}) {
   if (!config.ffmpegPath) {
     throw new Error("ffmpeg not available (CODARR_FFMPEG_PATH not set)");
   }
 
-  const args = ["-y", "-i", inputPath];
+  const inputArgs = ensureArray(data?.inputArgs);
+  const outputArgs = ensureArray(data?.outputArgs);
+  const args = ["-y", ...inputArgs];
 
   if (data?.hwaccel) {
     args.push("-hwaccel", String(data.hwaccel));
   }
+
+  args.push("-i", inputPath);
 
   if (data?.video?.codec) {
     args.push("-c:v", data.video.codec);
@@ -128,11 +355,29 @@ async function runFfmpeg({ inputPath, outputPath, data, log }) {
 
   const extraArgs = ensureArray(data?.extraArgs);
   args.push(...extraArgs.map(String));
-  args.push(outputPath);
+  args.push(...outputArgs.map(String));
+  if (outputPath) {
+    args.push(outputPath);
+  }
 
-  log(`FFmpeg: ${config.ffmpegPath} ${args.join(" ")}`);
+  const commandText = `${config.ffmpegPath} ${args.join(" ")}`;
+  log(`FFmpeg: ${commandText}`);
+  onCommand?.(commandText, args);
+  let buffer = "";
   await runCommand(config.ffmpegPath, args, {
-    onStderr: (text) => log(text.trim()),
+    onStderr: (text) => {
+      const trimmed = text.trim();
+      if (trimmed) log(trimmed);
+      buffer += text;
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop() ?? "";
+      lines.forEach((line) => {
+        const value = line.trim();
+        if (!value) return;
+        const progress = parseFfmpegStatsLine(value);
+        if (progress) onProgress?.(progress);
+      });
+    },
   });
 }
 
@@ -161,9 +406,12 @@ function buildGraphIndex(graph) {
 }
 
 function findInputNode(nodes) {
-  const inputNodes = Array.from(nodes.values()).filter((n) => n.type === "input_file");
+  const inputNodes = Array.from(nodes.values()).filter((n) => {
+    const elementType = getElementType(n);
+    return elementType === "input" || n.type === "input_file";
+  });
   if (inputNodes.length !== 1) {
-    throw new Error("Tree must contain exactly one input_file node");
+    throw new Error("Tree must contain exactly one input node");
   }
   return inputNodes[0];
 }
@@ -258,6 +506,10 @@ async function executeNode(node, context, log, elementDeps) {
       const reason = node.data?.reason ?? "Flow requested failure";
       throw new Error(reason);
     }
+    case "complete_job": {
+      log("Complete job: success");
+      return { complete: true };
+    }
     default:
       throw new Error(`Unsupported node type: ${node.type}`);
   }
@@ -266,7 +518,12 @@ async function executeNode(node, context, log, elementDeps) {
 function createJobApi(serverUrl) {
   return {
     async progress(jobId, progress, stage, log) {
-      await axios.post(`${serverUrl}/api/jobs/progress`, { jobId, progress, stage, log });
+      await axios.post(`${serverUrl}/api/jobs/progress`, {
+        jobId,
+        progress,
+        stage,
+        log,
+      });
     },
     async report(jobId, fileUpdates, stage, log, progress) {
       await axios.post(`${serverUrl}/api/jobs/report`, {
@@ -280,41 +537,220 @@ function createJobApi(serverUrl) {
     async complete(jobId, status) {
       await axios.post(`${serverUrl}/api/jobs/complete`, { jobId, status });
     },
+    async requeue(jobId, reason) {
+      await axios.post(`${serverUrl}/api/jobs/requeue`, { jobId, reason });
+    },
   };
 }
 
-async function executeHealthcheck(job, api) {
-  if (!job.file_path) throw new Error("healthcheck missing file_path");
-  const probe = await ffprobeFile(job.file_path);
-  const stats = fs.statSync(job.file_path);
+class JobLogStreamer {
+  constructor(api, jobId, { flushIntervalMs = 500, maxBatchChars = 240000 } = {}) {
+    this.api = api;
+    this.jobId = jobId;
+    this.queue = [];
+    this.timer = null;
+    this.flushing = false;
+    this.flushIntervalMs = flushIntervalMs;
+    this.maxBatchChars = maxBatchChars;
+  }
 
-  await api.report(
-    job.id,
-    {
-      initial_size: stats.size,
-      initial_container: probe.container,
-      initial_codec: probe.videoCodec,
-    },
-    "healthcheck",
-    `Healthcheck ok (container=${probe.container}, video=${probe.videoCodec}, audio=${probe.audioCodec})`,
-    100
-  );
+  log(stage, message) {
+    if (!message) return;
+    const text = String(message);
+    if (!text) return;
+    this.queue.push({ stage: stage ?? null, message: text });
+    this.schedule();
+  }
+
+  logLines(stage, message) {
+    if (!message) return;
+    const lines = String(message).split(/\r?\n/);
+    lines.forEach((line) => {
+      const trimmed = line.trimEnd();
+      if (trimmed) this.log(stage, trimmed);
+    });
+  }
+
+  schedule() {
+    if (this.timer) return;
+    this.timer = setTimeout(() => this.flush(), this.flushIntervalMs);
+  }
+
+  async flush() {
+    if (this.flushing) return;
+    this.flushing = true;
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+
+    while (this.queue.length) {
+      const batch = [];
+      let size = 0;
+      while (this.queue.length) {
+        const entry = this.queue[0];
+        const prefix = entry.stage ? `[${entry.stage}] ` : "";
+        const line = `${prefix}${entry.message}`;
+        const nextSize = size + line.length + 1;
+        if (batch.length && nextSize > this.maxBatchChars) break;
+        batch.push(line);
+        size = nextSize;
+        this.queue.shift();
+      }
+      const message = batch.join("\n");
+      const stage = this.queue.length ? this.queue[0]?.stage ?? null : batch[0]?.match(/^\[(.+?)\]/)?.[1] ?? null;
+      try {
+        await this.api.report(this.jobId, null, stage, message);
+      } catch {
+        break;
+      }
+    }
+
+    this.flushing = false;
+    if (this.queue.length) this.schedule();
+  }
+
+  async close() {
+    await this.flush();
+  }
 }
 
-async function executeTranscode(job, api) {
+async function executeHealthcheck(job, api, streamer, gpus = []) {
+  try {
+    streamer.log("healthcheck", `Healthcheck start (job=${job.id})`);
+    streamer.log("healthcheck", `Processing type: ${job.processing_type ?? "cpu"}`);
+    if (job.gpu_index != null) {
+      streamer.log("healthcheck", `GPU index: ${job.gpu_index}`);
+    }
+    if (!job.file_path) throw new Error("healthcheck missing file_path");
+    streamer.log("healthcheck", `Input file: ${job.file_path}`);
+
+    const probe = await ffprobeFile(job.file_path);
+    const stats = fs.statSync(job.file_path);
+    const subtitleList = Array.from(new Set(probe.subtitleCodecs ?? []));
+
+    streamer.log(
+      "healthcheck",
+      `Probe: container=${probe.container ?? "-"}, video=${probe.videoCodec ?? "-"}, audio=${probe.audioCodec ?? "-"}, duration=${probe.durationSec ?? "-"}s, frames=${probe.frameCount ?? "-"}`
+    );
+
+    if (subtitleList.length) {
+      streamer.log("healthcheck", `Subtitles: ${subtitleList.join(", ")}`);
+    } else {
+      streamer.log("healthcheck", "Subtitles: none");
+    }
+
+    const gpuInfo = Number.isFinite(Number(job.gpu_index)) ? gpus?.[Number(job.gpu_index)] : null;
+    if (gpuInfo) {
+      streamer.log(
+        "healthcheck",
+        `GPU: ${gpuInfo.vendor ?? ""} ${gpuInfo.model ?? ""}`.trim()
+      );
+    }
+
+    const args = getHealthcheckArgs(job.processing_type, job.accelerator, gpuInfo);
+    if (job.gpu_index != null && args.includes("-hwaccel")) {
+      args.push("-hwaccel_device", String(job.gpu_index));
+    }
+    streamer.log("healthcheck", `FFmpeg validate args: ${args.join(" ")}`);
+
+    const validation = await runFfmpegValidation(
+      job.file_path,
+      job.processing_type,
+      job.accelerator,
+      job.gpu_index,
+      gpuInfo,
+      {
+        onLog: (line) => streamer.log("healthcheck", line),
+        onProgress: async (data) => {
+          if (!probe.durationSec) return;
+          const percent = data.timeSec != null
+            ? Math.min(99, Math.round((data.timeSec / probe.durationSec) * 100))
+            : null;
+          if (percent != null) {
+            await api.progress(job.id, percent, "healthcheck", data.message);
+          }
+        },
+      }
+    );
+    if (validation.code !== 0 || validation.hasError) {
+      const detail = validation.lastErrorLine
+        ? ` (${validation.lastErrorLine})`
+        : ` (exit_code=${validation.code ?? 0})`;
+      throw new Error(`Healthcheck failed (ffmpeg validation error)${detail}`);
+    }
+
+    await api.report(
+      job.id,
+      {
+        initial_size: stats.size,
+        initial_container: probe.container,
+        initial_codec: probe.videoCodec,
+        initial_audio_codec: probe.audioCodec,
+        initial_subtitles: JSON.stringify(subtitleList),
+        initial_duration_sec: probe.durationSec,
+        initial_frame_count: probe.frameCount,
+      },
+      "healthcheck",
+      `Healthcheck ok (container=${probe.container}, video=${probe.videoCodec}, audio=${probe.audioCodec})`,
+      100
+    );
+
+    streamer.log("healthcheck", "Healthcheck complete: success");
+  } catch (error) {
+    const message = error?.stack ?? error?.message ?? String(error);
+    streamer.log("healthcheck", `Healthcheck error: ${message}`);
+    throw error;
+  }
+}
+
+async function executeTranscode(job, api, streamer) {
   const payload = safeJsonParse(job.transcode_payload);
   if (!payload?.graph) throw new Error("transcode payload missing tree graph");
   if (!job.file_path) throw new Error("transcode missing file_path");
 
+  streamer.log(
+    "transcode",
+    `Tree payload: ${payload.tree_id ?? "-"} (v${payload.tree_version ?? "?"})`
+  );
+  streamer.log("transcode", `Tree payload raw: ${JSON.stringify(payload)}`);
+
+  const probe = await ffprobeFile(job.file_path);
+
   await ensureElementRegistry();
-  const elementDeps = { ffprobeFile, runFfmpeg, resolveOutputPath };
+  const elementDeps = {
+    ffprobeFile,
+    runFfmpeg,
+    resolveOutputPath,
+    reportProgress: (percent, message) => api.progress(job.id, percent, "ffmpeg", message),
+    reportFileUpdate: (updates, stage, log, progress) =>
+      api.report(job.id, updates, stage, log, progress),
+    requeueJob: (jobId, reason) => api.requeue(jobId, reason),
+  };
   const graph = payload.graph;
+  try {
+    const nodesSummary = (graph?.nodes ?? []).map((node) => ({
+      id: node.id,
+      type: getElementType(node),
+      config: node?.data?.config ?? null,
+    }));
+    streamer.log("transcode", `Tree payload node configs: ${JSON.stringify(nodesSummary)}`);
+  } catch (error) {
+    streamer.log("transcode", `Tree payload node config dump failed: ${error?.message ?? error}`);
+  }
   const { nodes, bySource } = buildGraphIndex(graph);
   const start = findInputNode(nodes);
 
   const context = {
+    jobId: job.id,
     filePath: job.file_path,
-    input: null,
+    input: {
+      path: job.file_path,
+      container: probe.container ?? null,
+      durationSec: probe.durationSec ?? null,
+      frameCount: probe.frameCount ?? null,
+    },
+    probe,
     outputPath: null,
     outputContainer: null,
     finalPath: null,
@@ -328,6 +764,7 @@ async function executeTranscode(job, api) {
   let current = start;
   let step = 0;
   const totalSteps = Math.max(nodes.size, 1);
+  let completedByElement = false;
 
   while (current) {
     const count = (visitedCount.get(current.id) ?? 0) + 1;
@@ -337,9 +774,19 @@ async function executeTranscode(job, api) {
     }
 
     const stage = current.type;
-    const log = (message) => api.report(job.id, null, stage, message);
+    const log = (message) => streamer.log(stage, message);
 
     const result = await executeNode(current, context, log, elementDeps);
+    if (result?.requeue) {
+      completedByElement = true;
+      await api.report(job.id, null, stage, "Job re-queued by tree", 0);
+      return { requeued: true };
+    }
+    if (result?.complete) {
+      completedByElement = true;
+      await api.report(job.id, null, stage, "Tree completed successfully", 100);
+      break;
+    }
 
     const progress = Math.min(100, Math.round(((step + 1) / totalSteps) * 100));
     await api.progress(job.id, progress, stage);
@@ -354,6 +801,7 @@ async function executeTranscode(job, api) {
     const finalPath = context.finalPath ?? context.outputPath;
     const stats = fs.statSync(finalPath);
     const outputProbe = await ffprobeFile(finalPath);
+    const subtitleList = Array.from(new Set(outputProbe.subtitleCodecs ?? []));
     await api.report(
       job.id,
       {
@@ -361,30 +809,47 @@ async function executeTranscode(job, api) {
         final_container:
           context.outputContainer ?? outputProbe.container ?? path.extname(finalPath).replace(".", ""),
         final_codec: outputProbe.videoCodec ?? null,
+        final_audio_codec: outputProbe.audioCodec ?? null,
+        final_subtitles: JSON.stringify(subtitleList),
+        final_duration_sec: outputProbe.durationSec,
+        final_frame_count: outputProbe.frameCount,
         new_path: context.finalPath ? null : finalPath,
       },
       "transcode",
       "Transcode finished",
       100
     );
+  } else if (!completedByElement) {
+    await api.report(job.id, null, "transcode", "Tree completed successfully", 100);
   }
+  return { requeued: false };
 }
 
-export async function runJob(job) {
+export async function runJob(job, { gpus = [] } = {}) {
   const api = createJobApi(config.serverUrl);
+  const streamer = new JobLogStreamer(api, job.id);
   try {
+    if (job.type === "transcode" && !config.enableTranscode) {
+      throw new Error("Transcode processing is disabled on this node");
+    }
     if (job.type === "healthcheck") {
-      await executeHealthcheck(job, api);
+      await executeHealthcheck(job, api, streamer, gpus);
     } else if (job.type === "transcode") {
-      await executeTranscode(job, api);
+      const result = await executeTranscode(job, api, streamer);
+      if (result?.requeued) {
+        await streamer.close();
+        return;
+      }
     } else {
       throw new Error(`Unknown job type: ${job.type}`);
     }
 
+    await streamer.close();
     await api.complete(job.id, "completed");
   } catch (error) {
-    const message = error?.message ?? String(error);
-    await api.report(job.id, null, job.type, message);
+    const message = error?.stack ?? error?.message ?? String(error);
+    streamer.log(job.type, message);
+    await streamer.close();
     await api.complete(job.id, "failed");
   }
 }

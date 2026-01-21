@@ -12,6 +12,7 @@ export const def = createElementDef({
       type: "text",
       placeholder: "mp4",
       regex: "^[a-zA-Z0-9]+$",
+      suggestions: ["mkv", "mp4", "mov", "webm"],
     },
   ],
   outputs: [{ id: "out", label: "out" }],
@@ -20,6 +21,7 @@ export const def = createElementDef({
 export default {
   ...def,
   async execute({ context, node, log }) {
+    log?.("Set container: start");
     const config = node?.data?.config ?? {};
     context.ffmpeg = context.ffmpeg ?? {};
     if (config.container) context.ffmpeg.container = config.container;

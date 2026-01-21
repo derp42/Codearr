@@ -11,6 +11,7 @@ export const def = createElementDef({
       label: "Audio codec",
       type: "text",
       placeholder: "aac",
+      suggestions: ["aac", "ac3", "eac3", "opus", "mp3", "flac", "copy"],
     },
     {
       key: "bitrateKbps",
@@ -25,6 +26,7 @@ export const def = createElementDef({
 export default {
   ...def,
   async execute({ context, node, log }) {
+    log?.("Set audio: start");
     const config = node?.data?.config ?? {};
     context.ffmpeg = context.ffmpeg ?? {};
     context.ffmpeg.audio = { ...(context.ffmpeg.audio ?? {}), ...config };

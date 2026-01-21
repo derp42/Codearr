@@ -11,6 +11,7 @@ export const def = createElementDef({
 export default {
   ...def,
   async execute({ context, log }) {
+    log?.("Input: start");
     try {
       const snapshot = JSON.stringify(context ?? {}, null, 2);
       log(snapshot);

@@ -2,3 +2,12 @@
 node/src/tree-elements/elements/
 node/src/tree-elements/plugins/
 node/src/tree-elements/remote/
+
+# Dependencies
+**/node_modules/
+
+# Runtime data
+server/data/
+
+# Local environment files
+**/.env

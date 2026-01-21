@@ -46,6 +46,14 @@ function isMediaFile(filePath, library) {
   return include.has(ext);
 }
 
+function isOwnedOutput(db, filePath) {
+  if (!filePath) return false;
+  const row = db
+    .prepare("SELECT id FROM files WHERE new_path = ? LIMIT 1")
+    .get(filePath);
+  return Boolean(row?.id);
+}
+
 export function watchLibrary(db, library) {
   const watcher = chokidar.watch(library.path, {
     ignoreInitial: true,
@@ -55,6 +63,7 @@ export function watchLibrary(db, library) {
 
   watcher.on("add", (filePath, stats) => {
     if (!isMediaFile(filePath, library)) return;
+    if (isOwnedOutput(db, filePath)) return;
     const now = new Date().toISOString();
     const fileId = nanoid();
     const ext = path.extname(filePath).toLowerCase().replace(".", "");
@@ -87,6 +96,7 @@ export function watchLibrary(db, library) {
 
   watcher.on("change", (filePath, stats) => {
     if (!isMediaFile(filePath, library)) return;
+    if (isOwnedOutput(db, filePath)) return;
     const now = new Date().toISOString();
     db.prepare(
       "UPDATE files SET size = ?, mtime = ?, status = ?, updated_at = ? WHERE path = ?"
@@ -98,6 +108,11 @@ export function watchLibrary(db, library) {
 
   watcher.on("unlink", (filePath) => {
     if (!isMediaFile(filePath, library)) return;
+    if (isOwnedOutput(db, filePath)) return;
+    const row = db.prepare("SELECT id FROM files WHERE path = ?").get(filePath);
+    if (row?.id) {
+      db.prepare("DELETE FROM jobs WHERE file_id = ?").run(row.id);
+    }
     db.prepare("DELETE FROM files WHERE path = ?").run(filePath);
   });
 

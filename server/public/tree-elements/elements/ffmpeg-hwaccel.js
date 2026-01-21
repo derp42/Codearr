@@ -11,6 +11,7 @@ export const def = createElementDef({
       label: "Device",
       type: "text",
       placeholder: "cuda",
+      suggestions: ["cuda", "qsv", "vaapi", "videotoolbox", "amf"],
     },
   ],
   outputs: [{ id: "out", label: "out" }],
@@ -19,6 +20,7 @@ export const def = createElementDef({
 export default {
   ...def,
   async execute({ context, node, log }) {
+    log?.("HW accel: start");
     const config = node?.data?.config ?? {};
     context.ffmpeg = context.ffmpeg ?? {};
     context.ffmpeg.hwaccel = config.device ?? config.hwaccel ?? null;

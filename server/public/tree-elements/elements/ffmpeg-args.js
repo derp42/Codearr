@@ -3,12 +3,19 @@ import { createElementDef } from "../base.js";
 export const def = createElementDef({
   type: "ffmpeg_args",
   label: "FFmpeg Arguments",
-  description: "Appends additional FFmpeg CLI arguments.",
-  usage: "Provide one argument per line (e.g. -vf scale=1280:-2).",
+  description: "Adds input/output FFmpeg arguments to the command.",
+  usage: "Input args are placed before -i. Output args are placed before the output file.",
   fields: [
     {
-      key: "args",
-      label: "Arguments (one per line)",
+      key: "inputArgs",
+      label: "Input arguments (one per line)",
+      type: "textarea",
+      placeholder: "-hwaccel cuda\n-threads 4",
+      format: "lines",
+    },
+    {
+      key: "outputArgs",
+      label: "Output arguments (one per line)",
       type: "textarea",
       placeholder: "-vf scale=1280:-2\n-movflags +faststart",
       format: "lines",
@@ -20,11 +27,18 @@ export const def = createElementDef({
 export default {
   ...def,
   async execute({ context, node, log }) {
+    log?.("FFmpeg args: start");
     const config = node?.data?.config ?? {};
-    const args = Array.isArray(config.args) ? config.args : [];
-    context.ffmpeg = context.ffmpeg ?? { extraArgs: [] };
-    context.ffmpeg.extraArgs = [...(context.ffmpeg.extraArgs ?? []), ...args];
-    log?.(`FFmpeg args appended (${args.length})`);
+    const inputArgs = Array.isArray(config.inputArgs) ? config.inputArgs : [];
+    let outputArgs = Array.isArray(config.outputArgs) ? config.outputArgs : [];
+    const legacyArgs = Array.isArray(config.args) ? config.args : [];
+    if (!outputArgs.length && legacyArgs.length) outputArgs = legacyArgs;
+    context.ffmpeg = context.ffmpeg ?? {};
+    context.ffmpeg.inputArgs = [...(context.ffmpeg.inputArgs ?? []), ...inputArgs];
+    context.ffmpeg.outputArgs = [...(context.ffmpeg.outputArgs ?? []), ...outputArgs];
+    log?.(
+      `FFmpeg args set (input=${inputArgs.length}, output=${outputArgs.length})`
+    );
     return { nextHandle: "out" };
   },
 };

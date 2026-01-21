@@ -32,6 +32,7 @@ export function normalizeElementNode(node, registry) {
       label: node?.data?.label ?? def?.label ?? elementType,
       elementType,
       outputs: node?.data?.outputs ?? def?.outputs ?? [{ id: "out", label: "out" }],
+      __nodeId: node?.id ?? node?.data?.__nodeId,
     },
   };
 }

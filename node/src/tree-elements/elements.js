@@ -1,13 +1,3 @@
-import input from "./elements/input.js";
-import hardwareFilter from "./elements/hardware-filter.js";
-import ffmpegCommand from "./elements/ffmpeg-command.js";
-import ffmpegArgs from "./elements/ffmpeg-args.js";
-import ffmpegSetContainer from "./elements/ffmpeg-set-container.js";
-import ffmpegSetVideo from "./elements/ffmpeg-set-video.js";
-import ffmpegSetAudio from "./elements/ffmpeg-set-audio.js";
-import ffmpegHwaccel from "./elements/ffmpeg-hwaccel.js";
-import ffmpegExecute from "./elements/ffmpeg-execute.js";
-import verifyIntegrity from "./elements/verify-integrity.js";
 import fs from "fs/promises";
 import path from "path";
 import { fileURLToPath, pathToFileURL } from "url";
@@ -16,18 +6,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const pluginsDir = path.join(__dirname, "plugins");
 const remoteDir = path.join(__dirname, "remote");
 
-export const ELEMENT_HANDLERS = [
-  input,
-  hardwareFilter,
-  ffmpegCommand,
-  ffmpegArgs,
-  ffmpegSetContainer,
-  ffmpegSetVideo,
-  ffmpegSetAudio,
-  ffmpegHwaccel,
-  ffmpegExecute,
-  verifyIntegrity,
-];
+export const ELEMENT_HANDLERS = [];
 
 export async function loadPluginHandlers() {
   let pluginFiles = [];

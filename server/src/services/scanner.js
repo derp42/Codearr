@@ -30,6 +30,14 @@ function getLibraryExtensions(library) {
   };
 }
 
+function isOwnedOutput(db, filePath) {
+  if (!filePath) return false;
+  const row = db
+    .prepare("SELECT id FROM files WHERE new_path = ? LIMIT 1")
+    .get(filePath);
+  return Boolean(row?.id);
+}
+
 export async function scanLibrary(db, library) {
   const { include, exclude } = getLibraryExtensions(library);
   const patterns = [`**/*.{${include.join(",")}}`];
@@ -59,32 +67,42 @@ export async function scanLibrary(db, library) {
     return { filePath, stat, ext };
   });
 
-  const tx = db.transaction((items) => {
-    for (const item of items) {
-      if (!item) continue;
-      const { filePath, stat, ext } = item;
-      const fileId = nanoid();
-      insertFile.run(
-        fileId,
-        library.id,
-        filePath,
-        stat.size,
-        stat.mtimeMs,
-        "indexed",
-        stat.size,
-        ext || null,
-        now,
-        now
-      );
+  const batchSize = 200;
+  for (let i = 0; i < statsList.length; i += batchSize) {
+    const batch = statsList.slice(i, i + batchSize);
+    const tx = db.transaction((items) => {
+      for (const item of items) {
+        if (!item) continue;
+        const { filePath, stat, ext } = item;
+        if (isOwnedOutput(db, filePath)) continue;
+        const fileId = nanoid();
+        insertFile.run(
+          fileId,
+          library.id,
+          filePath,
+          stat.size,
+          stat.mtimeMs,
+          "indexed",
+          stat.size,
+          ext || null,
+          now,
+          now
+        );
 
-      const fileRow = db.prepare("SELECT id FROM files WHERE path = ?").get(filePath);
-      if (fileRow?.id) enqueueFile(db, fileRow.id);
-    }
-  });
+        const fileRow = db.prepare("SELECT id FROM files WHERE path = ?").get(filePath);
+        if (fileRow?.id) enqueueFile(db, fileRow.id);
+      }
+    });
 
-  tx(statsList);
+    tx(batch);
+    await yieldToEventLoop();
+  }
 
   enqueueMissingJobs(db, library.id);
+}
+
+async function yieldToEventLoop() {
+  await new Promise((resolve) => setTimeout(resolve, 0));
 }
 
 async function mapWithConcurrency(items, limit, fn) {
@@ -131,5 +149,23 @@ export function enqueueMissingJobs(db, libraryId) {
 
   for (const row of rows) {
     enqueueFile(db, row.id);
+  }
+}
+
+export async function pruneMissingLibraryFiles(db, library) {
+  if (!library?.id) return;
+  const rows = db
+    .prepare(
+      "SELECT id, path, new_path FROM files WHERE library_id = ?"
+    )
+    .all(library.id);
+
+  for (const row of rows) {
+    const hasOriginal = row.path ? fs.existsSync(row.path) : false;
+    const hasOutput = row.new_path ? fs.existsSync(row.new_path) : false;
+    if (!hasOriginal && !hasOutput) {
+      db.prepare("DELETE FROM jobs WHERE file_id = ?").run(row.id);
+      db.prepare("DELETE FROM files WHERE id = ?").run(row.id);
+    }
   }
 }

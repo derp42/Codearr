@@ -10,6 +10,7 @@ import { createJobsRouter } from "./routes/jobs.js";
 import { createTreesRouter } from "./routes/trees.js";
 import { scanLibrary, startLibraryScan } from "./services/scanner.js";
 import { watchLibrary } from "./services/watcher.js";
+import { pruneOrphanJobs, pruneStaleJobs } from "./services/queue.js";
 
 const app = express();
 const LOG_LEVELS = { silent: 0, error: 1, warn: 2, info: 3, verbose: 4 };
@@ -30,8 +31,9 @@ if (!fs.existsSync(dataDir)) {
 }
 
 logInfo("[boot] initializing database...");
-const db = initDb();
+const db = await initDb();
 logInfo(`[boot] database ready (${Date.now() - bootStart}ms)`);
+pruneOrphanJobs(db);
 const watchers = new Map();
 const scanTimers = new Map();
 
@@ -58,7 +60,7 @@ app.use((req, res, next) => {
   });
   next();
 });
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "100mb" }));
 app.use(express.static(path.join(__dirname, "..", "public")));
 
 app.get("/api/config", (req, res) => {
@@ -78,6 +80,10 @@ app.get("*", (req, res) => {
 app.listen(config.port, config.host, () => {
   logInfo(`[boot] server listening on ${config.publicUrl}`);
 });
+
+setInterval(() => {
+  pruneStaleJobs(db, config.jobStaleMs);
+}, Math.max(10000, Math.floor(config.jobStaleMs / 2)));
 
 bootLibraries().then(() => {
   logInfo(`[boot] startup complete (${Date.now() - bootStart}ms)`);

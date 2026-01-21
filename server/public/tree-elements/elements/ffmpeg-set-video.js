@@ -11,12 +11,24 @@ export const def = createElementDef({
       label: "Video codec",
       type: "text",
       placeholder: "hevc",
+      suggestions: ["hevc", "h264", "av1", "vp9", "copy"],
     },
     {
       key: "preset",
       label: "Video preset",
       type: "text",
       placeholder: "slow",
+      suggestions: [
+        "ultrafast",
+        "superfast",
+        "veryfast",
+        "faster",
+        "fast",
+        "medium",
+        "slow",
+        "slower",
+        "veryslow",
+      ],
     },
     {
       key: "crf",
@@ -31,6 +43,7 @@ export const def = createElementDef({
 export default {
   ...def,
   async execute({ context, node, log }) {
+    log?.("Set video: start");
     const config = node?.data?.config ?? {};
     context.ffmpeg = context.ffmpeg ?? {};
     context.ffmpeg.video = { ...(context.ffmpeg.video ?? {}), ...config };

@@ -13,6 +13,7 @@ export const def = createElementDef({
       placeholder: "nvidia, intel, amd",
       regex: "^[a-zA-Z0-9_\\s,.-]*$",
       format: "csv",
+      suggestions: ["nvidia, intel", "nvidia", "intel", "amd", "cpu"],
     },
   ],
   outputs: [
@@ -24,6 +25,7 @@ export const def = createElementDef({
 export default {
   ...def,
   async execute({ context, node, log }) {
+    log?.("Hardware filter: start");
     const config = node?.data?.config ?? {};
     const allowed = Array.isArray(config.allowed)
       ? config.allowed.map((v) => String(v).toLowerCase())
