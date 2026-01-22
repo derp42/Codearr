@@ -5,6 +5,7 @@ export const def = createElementDef({
   label: "Fail Job",
   description: "Stops execution and marks the job as failed.",
   usage: "Use to end a branch with an error message.",
+  weight: 0.2,
   fields: [
     {
       key: "reason",

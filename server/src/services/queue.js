@@ -1,4 +1,13 @@
 import { nanoid } from "nanoid";
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const treeElementsRoot = path.join(__dirname, "..", "..", "public", "tree-elements");
+const elementsDir = path.join(treeElementsRoot, "elements");
+const pluginsDir = path.join(treeElementsRoot, "plugins");
+const baseElementPath = path.join(treeElementsRoot, "base.js");
 
 const JOB_TYPES = {
   healthcheck: "healthcheck",
@@ -212,7 +221,7 @@ function nextJobsLegacy(db, nodeId, slots = { cpu: 1, gpu: 0 }, accelerators = [
         db,
         job.id,
         "system",
-        `Transcode payload (${job._payloadSource ?? "unknown"}): ${job.transcode_payload}`
+        `Transcode payload ready (source=${job._payloadSource ?? "unknown"})`
       );
     }
     if (nextType === JOB_TYPES.healthcheck) {
@@ -248,6 +257,7 @@ function nextJobsLegacy(db, nodeId, slots = { cpu: 1, gpu: 0 }, accelerators = [
     };
   });
 }
+
 
 function nextJobsTyped(db, nodeId, slots, accelerators = [], { allowTranscode = true } = {}) {
   const nodeTags = getNodeTags(db, nodeId);
@@ -404,7 +414,7 @@ function nextJobsTyped(db, nodeId, slots, accelerators = [], { allowTranscode = 
         db,
         job.id,
         "system",
-        `Transcode payload (${job._payloadSource ?? "unknown"}): ${job.transcode_payload}`
+        `Transcode payload ready (source=${job._payloadSource ?? "unknown"})`
       );
     }
     if (nextType === JOB_TYPES.healthcheck) {
@@ -634,10 +644,13 @@ function buildTranscodePayloadForNode(db, fileId, processingType, accelerators, 
     if (!matchesTreeRequirements(candidate, processingType, accelerators, nodeTags)) continue;
     try {
       const graph = JSON.parse(candidate.graph_json);
+      const minimized = minimizeGraph(graph);
+      const elements = buildElementBundle(minimized);
       return {
         tree_id: candidate.tree_id,
         tree_version: candidate.tree_version,
-        graph: minimizeGraph(graph),
+        graph: minimized,
+        elements,
       };
     } catch {
       continue;
@@ -655,7 +668,9 @@ function resolveTranscodePayloadWithSource(db, job, processingType, accelerators
           .prepare("SELECT required_accelerators, required_processing, required_tags_all, required_tags_any, required_tags_none FROM trees WHERE id = ?")
           .get(payload.tree_id);
         if (matchesTreeRequirements(treeRow, processingType, accelerators, nodeTags)) {
-          return { payload: { ...payload, graph: minimizeGraph(payload.graph) }, source: "job" };
+          const minimized = minimizeGraph(payload.graph);
+          const elements = payload.elements ?? buildElementBundle(minimized);
+          return { payload: { ...payload, graph: minimized, elements }, source: "job" };
         }
       }
     } catch {
@@ -694,33 +709,103 @@ function minimizeGraph(graph) {
   };
 }
 
+function buildElementBundle(graph) {
+  if (!graph || typeof graph !== "object") return null;
+  const nodes = Array.isArray(graph.nodes) ? graph.nodes : [];
+  const elementTypes = new Set(
+    nodes
+      .map((node) => node?.data?.elementType ?? node?.elementType ?? node?.type ?? null)
+      .filter(Boolean)
+      .map((value) => String(value))
+  );
+
+  let base = null;
+  try {
+    base = fs.readFileSync(baseElementPath, "utf8");
+  } catch {
+    base = null;
+  }
+
+  const elements = {};
+  for (const type of elementTypes) {
+    const fileName = `${String(type).replace(/_/g, "-")}.js`;
+    const filePath = path.join(elementsDir, fileName);
+    try {
+      if (fs.existsSync(filePath)) {
+        elements[fileName] = fs.readFileSync(filePath, "utf8");
+      }
+    } catch {
+      // ignore missing/invalid element files
+    }
+  }
+
+  const plugins = {};
+  try {
+    if (fs.existsSync(pluginsDir)) {
+      const entries = fs.readdirSync(pluginsDir, { withFileTypes: true });
+      entries
+        .filter((entry) => entry.isFile() && entry.name.endsWith(".js"))
+        .forEach((entry) => {
+          const filePath = path.join(pluginsDir, entry.name);
+          try {
+            plugins[entry.name] = fs.readFileSync(filePath, "utf8");
+          } catch {
+            // ignore plugin read errors
+          }
+        });
+    }
+  } catch {
+    // ignore plugin scan errors
+  }
+
+  return { base, elements, plugins };
+}
+
 function getNodeTags(db, nodeId) {
   if (!nodeId) return [];
   const row = db.prepare("SELECT tags_json FROM nodes WHERE id = ?").get(nodeId);
   return parseJsonArray(row?.tags_json);
 }
 
-export function reconcileNodeJobs(db, nodeId, activeJobIds = [], reason) {
+export function reconcileNodeJobs(db, nodeId, activeJobIds = [], reason, graceMs = 0) {
   if (!nodeId) return;
   const activeSet = new Set((activeJobIds ?? []).map((id) => String(id)));
   const jobs = db
     .prepare("SELECT * FROM jobs WHERE assigned_node_id = ? AND status = ?")
     .all(nodeId, JOB_STATUS.processing);
   jobs.forEach((job) => {
+    if (graceMs > 0) {
+      const updatedMs = Date.parse(job.updated_at);
+      if (!Number.isNaN(updatedMs) && Date.now() - updatedMs < graceMs) {
+        return;
+      }
+    }
     if (!activeSet.has(String(job.id))) {
       markJobFailed(db, job, reason ?? `Job orphaned on node ${nodeId}`);
     }
   });
 }
 
-export function pruneStaleJobs(db, staleMs) {
+export function pruneStaleJobs(db, staleMs, nodeStaleMs = 0) {
   const threshold = Date.now() - Math.max(0, Number(staleMs ?? 0));
+  const nodeThreshold = Date.now() - Math.max(0, Number(nodeStaleMs ?? 0));
   const jobs = db
-    .prepare("SELECT * FROM jobs WHERE status = ?")
+    .prepare(
+      "SELECT jobs.*, nodes.last_seen AS node_last_seen FROM jobs LEFT JOIN nodes ON jobs.assigned_node_id = nodes.id WHERE jobs.status = ?"
+    )
     .all(JOB_STATUS.processing);
   jobs.forEach((job) => {
     const updatedMs = Date.parse(job.updated_at);
-    if (!Number.isNaN(updatedMs) && updatedMs < threshold) {
+    if (Number.isNaN(updatedMs) || updatedMs >= threshold) return;
+
+    const hasNode = Boolean(job.assigned_node_id);
+    const nodeSeenMs = Date.parse(job.node_last_seen);
+    const nodeStale =
+      !hasNode ||
+      Number.isNaN(nodeSeenMs) ||
+      (nodeStaleMs > 0 && nodeSeenMs < nodeThreshold);
+
+    if (nodeStale) {
       markJobFailed(db, job, "Job stale: no update within timeout");
     }
   });

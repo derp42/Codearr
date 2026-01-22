@@ -4,6 +4,7 @@ import { execSync } from "child_process";
 import fs from "fs";
 import path from "path";
 import { config } from "./config.js";
+import { getGpuWorkload } from "./gpuWorkload.js";
 
 export function detectPlatform() {
   switch (process.platform) {
@@ -31,6 +32,7 @@ export async function getHardwareInfo() {
   const controllers = selectGpuControllers(graphics.controllers);
   const externalMetrics = queryExternalGpuMetrics();
   const gpus = buildGpuInventory({ detectedDiscrete, controllers, externalMetrics });
+  const ffmpegWarnings = probeFfmpegAccelerators(gpus);
 
   return {
     platform: detectPlatform(),
@@ -47,6 +49,7 @@ export async function getHardwareInfo() {
     },
     hwaccels,
     gpus,
+    ffmpegWarnings,
   };
 }
 
@@ -61,7 +64,9 @@ export async function collectMetrics() {
   const controllers = selectGpuControllers(graphics.controllers);
 
   const externalMetrics = queryExternalGpuMetrics();
-  const gpus = buildGpuMetrics({ detectedDiscrete, controllers, externalMetrics });
+  let gpus = buildGpuMetrics({ detectedDiscrete, controllers, externalMetrics });
+  const workload = await getGpuWorkload();
+  gpus = applyGpuWorkload(gpus, workload);
 
   return {
     cpu: { load: cpu.currentLoad },
@@ -72,7 +77,49 @@ export async function collectMetrics() {
       totalBytes: mem.total,
     },
     gpus,
+    gpuWorkload: workload,
   };
+}
+
+function applyGpuWorkload(gpus, workload) {
+  if (!workload || !Array.isArray(gpus) || gpus.length === 0) return gpus;
+  const vendor = String(workload.vendor ?? "").toLowerCase();
+  const matchesVendor = (gpu) => {
+    const value = String(gpu.vendor ?? "").toLowerCase();
+    if (!vendor || vendor === "unknown") return true;
+    if (vendor === "nvidia") return value.includes("nvidia");
+    if (vendor === "intel") return value.includes("intel");
+    if (vendor === "amd") return value.includes("amd") || value.includes("advanced micro devices") || value.includes("radeon");
+    if (vendor === "apple") return value.includes("apple");
+    return false;
+  };
+
+  let targetIndex = gpus.findIndex((gpu) => matchesVendor(gpu) && gpu.accelerator !== false);
+  if (targetIndex === -1) targetIndex = gpus.findIndex((gpu) => matchesVendor(gpu));
+  if (targetIndex === -1) targetIndex = 0;
+
+  const loads = [workload.encodeLoad, workload.decodeLoad, workload.processLoad]
+    .map((value) => Number(value))
+    .filter((value) => Number.isFinite(value));
+  const combinedLoad = loads.length ? Math.max(...loads) : null;
+  const hasAnyWorkload =
+    loads.length > 0 ||
+    Number.isFinite(Number(workload.vramUsage));
+
+  return gpus.map((gpu, index) => {
+    if (index !== targetIndex) return gpu;
+    return {
+      ...gpu,
+      utilization: hasAnyWorkload ? (combinedLoad ?? gpu.utilization) : gpu.utilization,
+      memoryUtilization:
+        Number.isFinite(Number(workload.vramUsage)) ? Number(workload.vramUsage) : gpu.memoryUtilization,
+      encodeLoad: workload.encodeLoad ?? null,
+      decodeLoad: workload.decodeLoad ?? null,
+      processLoad: workload.processLoad ?? null,
+      vramUsage: workload.vramUsage ?? null,
+      workloadRaw: workload.raw ?? null,
+    };
+  });
 }
 
 function selectGpuControllers(controllers = []) {
@@ -221,6 +268,86 @@ function detectHwaccels() {
     return accelLines.filter((line) => line && !line.startsWith("Hardware acceleration"));
   } catch {
     return [];
+  }
+}
+
+function probeFfmpegAccelerators(gpus = []) {
+  const ffmpegPath = config.ffmpegPath || findOnPath("ffmpeg");
+  if (!ffmpegPath) return [];
+
+  const encoders = listFfmpegEncoders(ffmpegPath);
+  const gpuVendors = new Set(
+    (gpus ?? []).map((gpu) => String(gpu.vendor ?? "").toLowerCase())
+  );
+
+  const warnings = [];
+  const probes = [];
+
+  if ([...gpuVendors].some((v) => v.includes("nvidia"))) {
+    ["h264_nvenc", "hevc_nvenc", "av1_nvenc"].forEach((enc) => {
+      if (encoders.has(enc)) probes.push({ encoder: enc, args: ["-c:v", enc] });
+    });
+  }
+
+  if ([...gpuVendors].some((v) => v.includes("intel"))) {
+    ["h264_qsv", "hevc_qsv", "av1_qsv"].forEach((enc) => {
+      if (encoders.has(enc)) probes.push({ encoder: enc, args: ["-c:v", enc] });
+    });
+  }
+
+  if ([...gpuVendors].some((v) => v.includes("amd"))) {
+    ["h264_amf", "hevc_amf", "av1_amf"].forEach((enc) => {
+      if (encoders.has(enc)) probes.push({ encoder: enc, args: ["-c:v", enc] });
+    });
+  }
+
+  if (process.platform === "darwin") {
+    ["h264_videotoolbox", "hevc_videotoolbox"].forEach((enc) => {
+      if (encoders.has(enc)) probes.push({ encoder: enc, args: ["-c:v", enc] });
+    });
+  }
+
+  probes.forEach((probe) => {
+    const result = runFfmpegProbe(ffmpegPath, probe.args);
+    if (!result.ok) {
+      warnings.push(`${probe.encoder}: ${result.error}`);
+    }
+  });
+
+  return warnings;
+}
+
+function listFfmpegEncoders(ffmpegPath) {
+  try {
+    const output = execSync(`"${ffmpegPath}" -hide_banner -encoders`, {
+      stdio: ["ignore", "pipe", "ignore"],
+    })
+      .toString()
+      .split(/\r?\n/)
+      .map((line) => line.trim());
+
+    const encoderSet = new Set();
+    output.forEach((line) => {
+      const match = line.match(/^\s*[VASD\.]{6}\s+(\S+)/);
+      if (match?.[1]) encoderSet.add(match[1]);
+    });
+    return encoderSet;
+  } catch {
+    return new Set();
+  }
+}
+
+function runFfmpegProbe(ffmpegPath, encoderArgs) {
+  try {
+    execSync(
+      `"${ffmpegPath}" -hide_banner -v error -f lavfi -i testsrc2=size=128x128:rate=1 -frames:v 1 ${encoderArgs.join(" ")} -f null -`,
+      { stdio: ["ignore", "pipe", "pipe"] }
+    );
+    return { ok: true, error: null };
+  } catch (error) {
+    const message = error?.stderr?.toString()?.trim() || error?.message || "probe failed";
+    const firstLine = message.split(/\r?\n/)[0] ?? "probe failed";
+    return { ok: false, error: firstLine };
   }
 }
 

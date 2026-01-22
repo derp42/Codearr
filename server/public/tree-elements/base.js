@@ -5,6 +5,7 @@ export function createElementDef({
   description = "",
   usage = "",
   fields = [],
+  weight = 1,
   source = "built-in",
   plugin = null,
 }) {
@@ -15,6 +16,7 @@ export function createElementDef({
     description,
     usage,
     fields,
+    weight,
     source,
     plugin,
   };

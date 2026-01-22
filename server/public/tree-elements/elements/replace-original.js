@@ -5,6 +5,7 @@ export const def = createElementDef({
   label: "Replace Original File",
   description: "Replaces the original file with the FFmpeg output.",
   usage: "Use after FFmpeg execute. Optionally keep a backup copy.",
+  weight: 1.5,
   fields: [
     {
       key: "keepBackup",

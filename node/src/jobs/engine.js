@@ -1,10 +1,9 @@
 import fs from "fs";
 import path from "path";
 import { spawn } from "child_process";
-import axios from "axios";
 import { config } from "../config.js";
-import { buildElementRegistry } from "../tree-elements/elements.js";
-import { getElementType } from "../tree-elements/base.js";
+import { Buffer } from "buffer";
+import { httpClient } from "../httpClient.js";
 
 function safeJsonParse(value) {
   if (!value) return null;
@@ -20,15 +19,21 @@ function normalizeCodec(value) {
   return String(value ?? "").toLowerCase();
 }
 
+function normalizeWeight(value, fallback = 1) {
+  const num = Number(value);
+  if (!Number.isFinite(num) || num <= 0) return fallback;
+  return num;
+}
+
 function ensureArray(value) {
   if (Array.isArray(value)) return value;
   if (value == null) return [];
   return [value];
 }
 
-async function runCommand(command, args, { onStdout, onStderr } = {}) {
+async function runCommand(command, args, { onStdout, onStderr, cwd } = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"], cwd });
     let stderr = "";
 
     child.stdout.on("data", (chunk) => {
@@ -56,6 +61,51 @@ function parseArgs(value) {
     .split(/\s+/)
     .map((part) => part.trim())
     .filter(Boolean);
+}
+
+function normalizePreset(codec, preset) {
+  const rawCodec = String(codec ?? "").toLowerCase();
+  const rawPreset = String(preset ?? "").toLowerCase();
+  if (!rawCodec.endsWith("_nvenc")) return preset;
+  const map = {
+    ultrafast: "p1",
+    superfast: "p2",
+    veryfast: "p3",
+    faster: "p4",
+    fast: "p5",
+    medium: "p6",
+    slow: "p7",
+    slower: "p7",
+    veryslow: "p7",
+  };
+  return map[rawPreset] ?? preset;
+}
+
+function getElementType(node) {
+  return node?.data?.elementType ?? node?.nodeType ?? node?.type ?? null;
+}
+
+const FALLBACK_ELEMENT_WEIGHTS = {
+  input: 0.2,
+  input_file: 0.2,
+  check_container: 0.2,
+  check_video_codec: 0.2,
+  check_audio_codec: 0.2,
+  build_ffmpeg: 0.5,
+  validate_size: 0.5,
+  replace_original: 1.5,
+  move_output_file: 1.5,
+  verify_integrity: 2,
+  requeue_job: 0.2,
+  complete_job: 0.2,
+  fail_job: 0.2,
+};
+
+function getElementWeight(elementType, registry) {
+  const fallback = normalizeWeight(FALLBACK_ELEMENT_WEIGHTS[elementType], 1);
+  if (!elementType || !registry || !registry.has(elementType)) return fallback;
+  const handler = registry.get(elementType);
+  return normalizeWeight(handler?.weight, fallback);
 }
 
 function getHealthcheckArgs(processingType, accelerator, gpuInfo) {
@@ -108,7 +158,7 @@ async function runFfmpegValidation(
       const text = chunk.toString();
       buffer += text;
 
-      const lines = buffer.split(/\r?\n/);
+      const lines = buffer.split(/[\r\n]+/);
       buffer = lines.pop() ?? "";
 
       lines.forEach((line) => {
@@ -322,7 +372,7 @@ function resolveOutputPath(inputPath, container) {
   return path.join(dir, `${base}.transcoded${ext}`);
 }
 
-async function runFfmpeg({ inputPath, outputPath, data, log, onProgress, onCommand } = {}) {
+async function runFfmpeg({ inputPath, outputPath, data, log, onProgress, onCommand, cwd } = {}) {
   if (!config.ffmpegPath) {
     throw new Error("ffmpeg not available (CODARR_FFMPEG_PATH not set)");
   }
@@ -341,16 +391,62 @@ async function runFfmpeg({ inputPath, outputPath, data, log, onProgress, onComma
     args.push("-c:v", data.video.codec);
   }
   if (data?.video?.preset) {
-    args.push("-preset", String(data.video.preset));
+    const presetValue = normalizePreset(data?.video?.codec, data.video.preset);
+    args.push("-preset", String(presetValue));
   }
   if (data?.video?.crf != null) {
-    args.push("-crf", String(data.video.crf));
+    const codec = String(data?.video?.codec ?? "").toLowerCase();
+    if (codec.endsWith("_nvenc")) {
+      args.push("-rc", "vbr", "-cq", String(data.video.crf));
+    } else {
+      args.push("-crf", String(data.video.crf));
+    }
+  }
+  if (data?.video?.bitrateKbps != null) {
+    args.push("-b:v", `${data.video.bitrateKbps}k`);
+  }
+  if (data?.video?.maxrateKbps != null) {
+    args.push("-maxrate", `${data.video.maxrateKbps}k`);
+  }
+  if (data?.video?.bufsizeKbps != null) {
+    args.push("-bufsize", `${data.video.bufsizeKbps}k`);
+  }
+  if (data?.video?.profile) {
+    args.push("-profile:v", String(data.video.profile));
+  }
+  if (data?.video?.level) {
+    args.push("-level", String(data.video.level));
+  }
+  if (data?.video?.tune) {
+    args.push("-tune", String(data.video.tune));
+  }
+  if (data?.video?.pixFmt) {
+    args.push("-pix_fmt", String(data.video.pixFmt));
   }
   if (data?.audio?.codec) {
     args.push("-c:a", data.audio.codec);
   }
+  if (data?.subtitles?.disabled) {
+    args.push("-sn");
+  } else if (data?.subtitles?.codec) {
+    args.push("-c:s", data.subtitles.codec);
+  }
   if (data?.audio?.bitrateKbps != null) {
     args.push("-b:a", `${data.audio.bitrateKbps}k`);
+  }
+  if (data?.audio?.channels != null) {
+    args.push("-ac", String(data.audio.channels));
+  }
+  if (data?.audio?.sampleRate != null) {
+    args.push("-ar", String(data.audio.sampleRate));
+  }
+  if (data?.audio?.channelLayout) {
+    args.push("-channel_layout", String(data.audio.channelLayout));
+  }
+
+  const filters = ensureArray(data?.filters);
+  if (filters.length) {
+    args.push("-vf", filters.map(String).join(","));
   }
 
   const extraArgs = ensureArray(data?.extraArgs);
@@ -360,7 +456,7 @@ async function runFfmpeg({ inputPath, outputPath, data, log, onProgress, onComma
     args.push(outputPath);
   }
 
-  const commandText = `${config.ffmpegPath} ${args.join(" ")}`;
+  const commandText = [config.ffmpegPath, ...args].map(formatCommandArg).join(" ");
   log(`FFmpeg: ${commandText}`);
   onCommand?.(commandText, args);
   let buffer = "";
@@ -369,7 +465,7 @@ async function runFfmpeg({ inputPath, outputPath, data, log, onProgress, onComma
       const trimmed = text.trim();
       if (trimmed) log(trimmed);
       buffer += text;
-      const lines = buffer.split(/\r?\n/);
+      const lines = buffer.split(/[\r\n]+/);
       buffer = lines.pop() ?? "";
       lines.forEach((line) => {
         const value = line.trim();
@@ -378,18 +474,82 @@ async function runFfmpeg({ inputPath, outputPath, data, log, onProgress, onComma
         if (progress) onProgress?.(progress);
       });
     },
+    cwd,
   });
 }
 
-let elementRegistryPromise = null;
-let elementRegistry = null;
-
-async function ensureElementRegistry() {
-  if (!elementRegistryPromise) {
-    elementRegistryPromise = buildElementRegistry();
+function formatCommandArg(value) {
+  const text = String(value ?? "");
+  if (!text) return "";
+  if (/[^\w@%+=:,./-]/.test(text)) {
+    return `"${text.replace(/"/g, "\\\"")}"`;
   }
-  elementRegistry = await elementRegistryPromise;
-  return elementRegistry;
+  return text;
+}
+
+function translatePath(value, direction = "toLocal") {
+  const mappings = Array.isArray(config.pathMappings) ? config.pathMappings : [];
+  if (!value || !mappings.length) return value;
+
+  const raw = String(value);
+  const isWindows = process.platform === "win32";
+  for (const mapping of mappings) {
+    const from = String(direction === "toLocal" ? mapping.from : mapping.to);
+    const to = String(direction === "toLocal" ? mapping.to : mapping.from);
+    if (!from || !to) continue;
+    if (isWindows) {
+      if (raw.toLowerCase().startsWith(from.toLowerCase())) {
+        return `${to}${raw.slice(from.length)}`;
+      }
+    } else if (raw.startsWith(from)) {
+      return `${to}${raw.slice(from.length)}`;
+    }
+  }
+  return raw;
+}
+
+function normalizePathForCompare(value) {
+  if (!value) return "";
+  const normalized = String(value).replace(/\\/g, "/");
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+
+async function buildElementRegistryFromBundle(bundle) {
+  if (!bundle?.base) {
+    throw new Error("Element bundle missing base.js");
+  }
+  const baseUrl = codeToDataUrl(bundle.base);
+  const elements = bundle.elements && typeof bundle.elements === "object" ? bundle.elements : {};
+  const plugins = bundle.plugins && typeof bundle.plugins === "object" ? bundle.plugins : {};
+  const handlers = [];
+
+  const loadHandler = async (code) => {
+    if (typeof code !== "string" || !code.trim()) return null;
+    const rewritten = rewriteBaseImport(code, baseUrl);
+    const url = codeToDataUrl(rewritten);
+    const mod = await import(url);
+    return mod?.default ?? mod?.handler ?? null;
+  };
+
+  for (const code of Object.values(elements)) {
+    try {
+      const handler = await loadHandler(code);
+      if (handler) handlers.push(handler);
+    } catch (error) {
+      console.warn(`Element bundle load failed:`, error?.message ?? error);
+    }
+  }
+
+  for (const code of Object.values(plugins)) {
+    try {
+      const handler = await loadHandler(code);
+      if (handler) handlers.push(handler);
+    } catch (error) {
+      console.warn(`Plugin bundle load failed:`, error?.message ?? error);
+    }
+  }
+
+  return new Map(handlers.map((handler) => [handler.type, handler]));
 }
 
 function buildGraphIndex(graph) {
@@ -403,6 +563,22 @@ function buildGraphIndex(graph) {
   }
 
   return { nodes, edges, bySource };
+}
+
+function computeOverallProgress({ completedWeight, currentWeight, elementPercent, totalWeight } = {}) {
+  const total = normalizeWeight(totalWeight, 1);
+  const completed = normalizeWeight(completedWeight, 0);
+  const current = normalizeWeight(currentWeight, 0);
+  const element = Number(elementPercent);
+  const normalizedElement = Number.isFinite(element) ? clampProgress(element) / 100 : 0;
+  const progress = ((completed + current * normalizedElement) / total) * 100;
+  return clampProgress(progress);
+}
+
+function clampProgress(value) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return 0;
+  return Math.max(0, Math.min(100, num));
 }
 
 function findInputNode(nodes) {
@@ -425,9 +601,13 @@ function selectNextNode(bySource, nodeId, handle) {
 
 async function executeNode(node, context, log, elementDeps) {
   const elementType = getElementType(node);
-  if (elementType && elementRegistry && elementRegistry.has(elementType)) {
-    const handler = elementRegistry.get(elementType);
+  const registry = elementDeps?.elementRegistry ?? null;
+  if (elementType && registry && registry.has(elementType)) {
+    const handler = registry.get(elementType);
     return handler.execute({ context, node, log, ...elementDeps });
+  }
+  if (elementType) {
+    throw new Error(`Missing element handler: ${elementType}`);
   }
 
   switch (node.type) {
@@ -471,7 +651,13 @@ async function executeNode(node, context, log, elementDeps) {
     case "build_ffmpeg": {
       const container = node.data?.container ?? context.input?.container ?? "mkv";
       const outputPath = resolveOutputPath(context.filePath, container);
-      await runFfmpeg({ inputPath: context.filePath, outputPath, data: node.data, log });
+      await runFfmpeg({
+        inputPath: context.filePath,
+        outputPath,
+        data: node.data,
+        log,
+        cwd: context.jobTempDir ?? undefined,
+      });
       context.outputPath = outputPath;
       context.outputContainer = container;
       return { nextHandle: "default" };
@@ -516,35 +702,54 @@ async function executeNode(node, context, log, elementDeps) {
 }
 
 function createJobApi(serverUrl) {
+  const postWithRetry = async (path, payload, { attempts = 3, delayMs = 500, swallow = false } = {}) => {
+    let lastError = null;
+    for (let i = 0; i < attempts; i += 1) {
+      try {
+        await httpClient.post(`${serverUrl}${path}`, payload);
+        return true;
+      } catch (error) {
+        lastError = error;
+        if (i < attempts - 1) {
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
+        }
+      }
+    }
+    const message = lastError?.message ?? String(lastError);
+    console.error(`Job API request failed (${path}):`, message);
+    if (!swallow) throw lastError;
+    return false;
+  };
   return {
     async progress(jobId, progress, stage, log) {
-      await axios.post(`${serverUrl}/api/jobs/progress`, {
-        jobId,
-        progress,
-        stage,
-        log,
-      });
+      await postWithRetry(
+        "/api/jobs/progress",
+        { jobId, progress, stage, log },
+        { swallow: true }
+      );
     },
     async report(jobId, fileUpdates, stage, log, progress) {
-      await axios.post(`${serverUrl}/api/jobs/report`, {
-        jobId,
-        fileUpdates,
-        stage,
-        log,
-        progress,
-      });
+      await postWithRetry(
+        "/api/jobs/report",
+        { jobId, fileUpdates, stage, log, progress },
+        { swallow: true }
+      );
     },
     async complete(jobId, status) {
-      await axios.post(`${serverUrl}/api/jobs/complete`, { jobId, status });
+      await postWithRetry("/api/jobs/complete", { jobId, status }, { swallow: false });
     },
     async requeue(jobId, reason) {
-      await axios.post(`${serverUrl}/api/jobs/requeue`, { jobId, reason });
+      await postWithRetry("/api/jobs/requeue", { jobId, reason }, { swallow: false });
     },
   };
 }
 
 class JobLogStreamer {
-  constructor(api, jobId, { flushIntervalMs = 500, maxBatchChars = 240000 } = {}) {
+  constructor(
+    api,
+    jobId,
+    { flushIntervalMs = 500, maxBatchChars = 240000, maxLineChars = 20000 } = {}
+  ) {
     this.api = api;
     this.jobId = jobId;
     this.queue = [];
@@ -552,12 +757,16 @@ class JobLogStreamer {
     this.flushing = false;
     this.flushIntervalMs = flushIntervalMs;
     this.maxBatchChars = maxBatchChars;
+    this.maxLineChars = maxLineChars;
   }
 
   log(stage, message) {
     if (!message) return;
-    const text = String(message);
+    let text = String(message);
     if (!text) return;
+    if (text.length > this.maxLineChars) {
+      text = `${text.slice(0, this.maxLineChars)}... [truncated]`;
+    }
     this.queue.push({ stage: stage ?? null, message: text });
     this.schedule();
   }
@@ -623,10 +832,14 @@ async function executeHealthcheck(job, api, streamer, gpus = []) {
       streamer.log("healthcheck", `GPU index: ${job.gpu_index}`);
     }
     if (!job.file_path) throw new Error("healthcheck missing file_path");
-    streamer.log("healthcheck", `Input file: ${job.file_path}`);
+    const inputPath = translatePath(job.file_path, "toLocal");
+    if (inputPath !== job.file_path) {
+      streamer.log("healthcheck", `Input path translated: ${job.file_path} -> ${inputPath}`);
+    }
+    streamer.log("healthcheck", `Input file: ${inputPath}`);
 
-    const probe = await ffprobeFile(job.file_path);
-    const stats = fs.statSync(job.file_path);
+    const probe = await ffprobeFile(inputPath);
+    const stats = fs.statSync(inputPath);
     const subtitleList = Array.from(new Set(probe.subtitleCodecs ?? []));
 
     streamer.log(
@@ -655,7 +868,7 @@ async function executeHealthcheck(job, api, streamer, gpus = []) {
     streamer.log("healthcheck", `FFmpeg validate args: ${args.join(" ")}`);
 
     const validation = await runFfmpegValidation(
-      job.file_path,
+      inputPath,
       job.processing_type,
       job.accelerator,
       job.gpu_index,
@@ -709,126 +922,230 @@ async function executeTranscode(job, api, streamer) {
   if (!payload?.graph) throw new Error("transcode payload missing tree graph");
   if (!job.file_path) throw new Error("transcode missing file_path");
 
-  streamer.log(
-    "transcode",
-    `Tree payload: ${payload.tree_id ?? "-"} (v${payload.tree_version ?? "?"})`
-  );
-  streamer.log("transcode", `Tree payload raw: ${JSON.stringify(payload)}`);
+  const translateToLocal = (value) => translatePath(value, "toLocal");
+  const translateToRemote = (value) => translatePath(value, "toRemote");
+  const inputPath = translateToLocal(job.file_path);
+  if (inputPath !== job.file_path) {
+    streamer.log("transcode", `Input path translated: ${job.file_path} -> ${inputPath}`);
+  }
 
-  const probe = await ffprobeFile(job.file_path);
+  let jobTempDir = null;
+  const tempPrefix = "codarr_";
+  if (config.tempDir) {
+    jobTempDir = path.join(config.tempDir, `${tempPrefix}${job.id}`);
+    fs.mkdirSync(jobTempDir, { recursive: true });
+    streamer.log("transcode", `Temp dir: ${jobTempDir}`);
+  }
 
-  await ensureElementRegistry();
-  const elementDeps = {
-    ffprobeFile,
-    runFfmpeg,
-    resolveOutputPath,
-    reportProgress: (percent, message) => api.progress(job.id, percent, "ffmpeg", message),
-    reportFileUpdate: (updates, stage, log, progress) =>
-      api.report(job.id, updates, stage, log, progress),
-    requeueJob: (jobId, reason) => api.requeue(jobId, reason),
-  };
-  const graph = payload.graph;
   try {
-    const nodesSummary = (graph?.nodes ?? []).map((node) => ({
-      id: node.id,
-      type: getElementType(node),
-      config: node?.data?.config ?? null,
-    }));
-    streamer.log("transcode", `Tree payload node configs: ${JSON.stringify(nodesSummary)}`);
-  } catch (error) {
-    streamer.log("transcode", `Tree payload node config dump failed: ${error?.message ?? error}`);
-  }
-  const { nodes, bySource } = buildGraphIndex(graph);
-  const start = findInputNode(nodes);
-
-  const context = {
-    jobId: job.id,
-    filePath: job.file_path,
-    input: {
-      path: job.file_path,
-      container: probe.container ?? null,
-      durationSec: probe.durationSec ?? null,
-      frameCount: probe.frameCount ?? null,
-    },
-    probe,
-    outputPath: null,
-    outputContainer: null,
-    finalPath: null,
-    backupPath: null,
-    node: {
-      accelerators: ["cpu", job.accelerator ?? "cpu"].filter(Boolean),
-    },
-  };
-
-  const visitedCount = new Map();
-  let current = start;
-  let step = 0;
-  const totalSteps = Math.max(nodes.size, 1);
-  let completedByElement = false;
-
-  while (current) {
-    const count = (visitedCount.get(current.id) ?? 0) + 1;
-    visitedCount.set(current.id, count);
-    if (count > nodes.size + 5) {
-      throw new Error("Tree execution halted (possible cycle)");
-    }
-
-    const stage = current.type;
-    const log = (message) => streamer.log(stage, message);
-
-    const result = await executeNode(current, context, log, elementDeps);
-    if (result?.requeue) {
-      completedByElement = true;
-      await api.report(job.id, null, stage, "Job re-queued by tree", 0);
-      return { requeued: true };
-    }
-    if (result?.complete) {
-      completedByElement = true;
-      await api.report(job.id, null, stage, "Tree completed successfully", 100);
-      break;
-    }
-
-    const progress = Math.min(100, Math.round(((step + 1) / totalSteps) * 100));
-    await api.progress(job.id, progress, stage);
-
-    const edge = selectNextNode(bySource, current.id, result?.nextHandle ?? "default");
-    if (!edge) break;
-    current = nodes.get(edge.target);
-    step += 1;
-  }
-
-  if (context.outputPath && fs.existsSync(context.outputPath)) {
-    const finalPath = context.finalPath ?? context.outputPath;
-    const stats = fs.statSync(finalPath);
-    const outputProbe = await ffprobeFile(finalPath);
-    const subtitleList = Array.from(new Set(outputProbe.subtitleCodecs ?? []));
-    await api.report(
-      job.id,
-      {
-        final_size: stats.size,
-        final_container:
-          context.outputContainer ?? outputProbe.container ?? path.extname(finalPath).replace(".", ""),
-        final_codec: outputProbe.videoCodec ?? null,
-        final_audio_codec: outputProbe.audioCodec ?? null,
-        final_subtitles: JSON.stringify(subtitleList),
-        final_duration_sec: outputProbe.durationSec,
-        final_frame_count: outputProbe.frameCount,
-        new_path: context.finalPath ? null : finalPath,
-      },
+    streamer.log("transcode", `Transcode start (job=${job.id}, type=${job.type ?? "-"})`);
+    streamer.log(
       "transcode",
-      "Transcode finished",
-      100
+      `Tree payload: ${payload.tree_id ?? "-"} (v${payload.tree_version ?? "?"})`
     );
-  } else if (!completedByElement) {
-    await api.report(job.id, null, "transcode", "Tree completed successfully", 100);
+    try {
+      const bundle = payload?.elements ?? {};
+      const elementCount = bundle.elements && typeof bundle.elements === "object"
+        ? Object.keys(bundle.elements).length
+        : 0;
+      const pluginCount = bundle.plugins && typeof bundle.plugins === "object"
+        ? Object.keys(bundle.plugins).length
+        : 0;
+      const baseSize = bundle.base ? String(bundle.base).length : 0;
+      streamer.log(
+        "transcode",
+        `Tree payload bundle: elements=${elementCount}, plugins=${pluginCount}, baseBytes=${baseSize}`
+      );
+    } catch (error) {
+      streamer.log("transcode", `Tree payload bundle summary failed: ${error?.message ?? error}`);
+    }
+
+    const probe = await ffprobeFile(inputPath);
+
+    const elementBundle = payload?.elements;
+    if (!elementBundle?.base) {
+      throw new Error("transcode payload missing element bundle");
+    }
+    const elementRegistry = await buildElementRegistryFromBundle(elementBundle);
+    const elementDeps = {
+      ffprobeFile,
+      runFfmpeg,
+      resolveOutputPath,
+      reportProgress: (percent, message) => {
+        const overall = computeOverallProgress({
+          completedWeight: context.completedWeight,
+          currentWeight: context.currentWeight,
+          elementPercent: percent,
+          totalWeight: context.weightTotal,
+        });
+        const stage = context.currentStage ?? "ffmpeg";
+        return api.progress(job.id, overall, stage, message);
+      },
+      reportFileUpdate: (updates, stage, log, progress) => {
+        const mapped = updates && typeof updates === "object" ? { ...updates } : updates;
+        if (mapped?.new_path) {
+          mapped.new_path = translateToRemote(mapped.new_path);
+        }
+        return api.report(job.id, mapped, stage, log, progress);
+      },
+      requeueJob: (jobId, reason) => api.requeue(jobId, reason),
+      elementRegistry,
+    };
+    const graph = payload.graph;
+    // No full payload logging; per-element config is logged by each element as needed.
+    const { nodes, bySource } = buildGraphIndex(graph);
+    const start = findInputNode(nodes);
+    const weightByNodeId = new Map();
+    let totalWeight = 0;
+    for (const node of nodes.values()) {
+      const elementType = getElementType(node);
+      const weight = getElementWeight(elementType, elementRegistry);
+      weightByNodeId.set(node.id, weight);
+      totalWeight += weight;
+    }
+    const safeTotalWeight =
+      Number.isFinite(totalWeight) && totalWeight > 0 ? totalWeight : Math.max(nodes.size, 1);
+
+    const context = {
+      jobId: job.id,
+      filePath: inputPath,
+      originalFilePath: job.file_path,
+      jobTempDir,
+      translatePathToLocal: translateToLocal,
+      translatePathToRemote: translateToRemote,
+      input: {
+        path: inputPath,
+        container: probe.container ?? null,
+        durationSec: probe.durationSec ?? null,
+        frameCount: probe.frameCount ?? null,
+      },
+      probe,
+      outputPath: null,
+      outputContainer: null,
+      finalPath: null,
+      backupPath: null,
+      weightTotal: safeTotalWeight,
+      currentWeight: 0,
+      completedWeight: 0,
+      node: {
+        accelerators: ["cpu", job.accelerator ?? "cpu"].filter(Boolean),
+      },
+    };
+
+    const visitedCount = new Map();
+    let current = start;
+    let step = 0;
+    const totalSteps = Math.max(nodes.size, 1);
+    let completedWeight = 0;
+    let completedByElement = false;
+    let lastStepAt = Date.now();
+    let lastProgressAt = 0;
+    const progressIntervalMs = 1000;
+
+    while (current) {
+      const count = (visitedCount.get(current.id) ?? 0) + 1;
+      visitedCount.set(current.id, count);
+      if (count > nodes.size + 5) {
+        throw new Error("Tree execution halted (possible cycle)");
+      }
+
+      const stage = current.type;
+      const log = (message) => streamer.log(stage, message);
+      const elementType = getElementType(current);
+      const configSummary = current?.data?.config
+        ? JSON.stringify(current.data.config)
+        : "{}";
+      const now = Date.now();
+      const gapMs = now - lastStepAt;
+      log(`Element start: ${elementType ?? "unknown"} (+${gapMs}ms) config=${configSummary}`);
+      const currentWeight = weightByNodeId.get(current.id) ?? 1;
+      context.currentStage = elementType ?? "unknown";
+      context.currentStepIndex = step;
+      context.totalSteps = totalSteps;
+      context.currentWeight = currentWeight;
+      context.completedWeight = completedWeight;
+      context.weightTotal = safeTotalWeight;
+      const elementStart = Date.now();
+
+      const result = await executeNode(current, context, log, elementDeps);
+      const elementMs = Date.now() - elementStart;
+      log(`Element complete: ${elementType ?? "unknown"} (${elementMs}ms)`);
+      lastStepAt = Date.now();
+      if (result?.requeue) {
+        completedByElement = true;
+        await api.report(job.id, null, stage, "Job re-queued by tree", 0);
+        return { requeued: true };
+      }
+      if (result?.complete) {
+        completedByElement = true;
+        await api.report(job.id, null, stage, "Tree completed successfully", 100);
+        break;
+      }
+
+      const progress = Math.round(
+        computeOverallProgress({
+          completedWeight,
+          currentWeight,
+          elementPercent: 100,
+          totalWeight: safeTotalWeight,
+        })
+      );
+      const progressNow = Date.now();
+      if (progressNow - lastProgressAt >= progressIntervalMs) {
+        lastProgressAt = progressNow;
+        void api.progress(job.id, progress, stage);
+      }
+
+      completedWeight += currentWeight;
+
+      const edge = selectNextNode(bySource, current.id, result?.nextHandle ?? "default");
+      if (!edge) break;
+      current = nodes.get(edge.target);
+      step += 1;
+    }
+
+    if (context.outputPath && fs.existsSync(context.outputPath)) {
+      const finalPathLocal = context.finalPath ?? context.outputPath;
+      const finalPathRemote = translateToRemote(finalPathLocal);
+      const originalRemote = context.originalFilePath ?? job.file_path ?? null;
+      const isSameAsOriginal =
+        originalRemote && finalPathRemote
+          ? normalizePathForCompare(originalRemote) === normalizePathForCompare(finalPathRemote)
+          : false;
+      const stats = fs.statSync(finalPathLocal);
+      const outputProbe = await ffprobeFile(finalPathLocal);
+      const subtitleList = Array.from(new Set(outputProbe.subtitleCodecs ?? []));
+      await api.report(
+        job.id,
+        {
+          final_size: stats.size,
+          final_container:
+            context.outputContainer ?? outputProbe.container ?? path.extname(finalPathLocal).replace(".", ""),
+          final_codec: outputProbe.videoCodec ?? null,
+          final_audio_codec: outputProbe.audioCodec ?? null,
+          final_subtitles: JSON.stringify(subtitleList),
+          final_duration_sec: outputProbe.durationSec,
+          final_frame_count: outputProbe.frameCount,
+          new_path: isSameAsOriginal ? null : finalPathRemote,
+        },
+        "transcode",
+        "Transcode finished",
+        100
+      );
+    } else if (!completedByElement) {
+      await api.report(job.id, null, "transcode", "Tree completed successfully", 100);
+    }
+    return { requeued: false };
+  } finally {
+    cleanupJobTempDir(jobTempDir, streamer);
   }
-  return { requeued: false };
 }
 
 export async function runJob(job, { gpus = [] } = {}) {
   const api = createJobApi(config.serverUrl);
   const streamer = new JobLogStreamer(api, job.id);
   try {
+    console.log(`Job ${job.id} start (type=${job.type ?? "-"}, processing=${job.processing_type ?? "-"})`);
     if (job.type === "transcode" && !config.enableTranscode) {
       throw new Error("Transcode processing is disabled on this node");
     }
@@ -846,10 +1163,37 @@ export async function runJob(job, { gpus = [] } = {}) {
 
     await streamer.close();
     await api.complete(job.id, "completed");
+    console.log(`Job ${job.id} completed successfully`);
   } catch (error) {
     const message = error?.stack ?? error?.message ?? String(error);
+    console.error(`Job ${job?.id ?? "?"} failed:`, message);
     streamer.log(job.type, message);
     await streamer.close();
     await api.complete(job.id, "failed");
   }
+}
+
+function cleanupJobTempDir(jobTempDir, streamer) {
+  if (!jobTempDir) return;
+  try {
+    fs.rmSync(jobTempDir, { recursive: true, force: true });
+    streamer?.log("system", `Temp dir cleaned: ${jobTempDir}`);
+  } catch (error) {
+    streamer?.log(
+      "system",
+      `Temp dir cleanup failed (${jobTempDir}): ${error?.message ?? error}`
+    );
+  }
+}
+
+function rewriteBaseImport(code, baseUrl) {
+  return String(code)
+    .replace(/(['"])\.\.\/base\.js\1/g, `'${baseUrl}'`)
+    .replace(/(['"])\.\/base\.js\1/g, `'${baseUrl}'`)
+    .replace(/(['"])base\.js\1/g, `'${baseUrl}'`);
+}
+
+function codeToDataUrl(code) {
+  const encoded = Buffer.from(String(code ?? ""), "utf8").toString("base64");
+  return `data:text/javascript;base64,${encoded}`;
 }

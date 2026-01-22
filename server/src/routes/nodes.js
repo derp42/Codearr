@@ -35,7 +35,7 @@ export function createNodesRouter(db) {
     );
 
     reconcileNodeJobs(db, id, jobs ?? [], "Job orphaned on node register");
-    pruneStaleJobs(db, config.jobStaleMs);
+    pruneStaleJobs(db, config.jobStaleMs, config.nodeStaleMs);
     res.json({ ok: true, last_seen: now });
   });
 
@@ -59,8 +59,8 @@ export function createNodesRouter(db) {
       id
     );
 
-    reconcileNodeJobs(db, id, jobs ?? [], "Job orphaned on heartbeat");
-    pruneStaleJobs(db, config.jobStaleMs);
+    reconcileNodeJobs(db, id, jobs ?? [], "Job orphaned on heartbeat", 30000);
+    pruneStaleJobs(db, config.jobStaleMs, config.nodeStaleMs);
     res.json({ ok: true, last_seen: now });
   });
 

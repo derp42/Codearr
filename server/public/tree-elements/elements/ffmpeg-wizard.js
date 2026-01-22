@@ -1,0 +1,126 @@
+import { createElementDef } from "../base.js";
+
+export const def = createElementDef({
+  type: "ffmpeg_wizard",
+  label: "FFmpeg Wizard",
+  description: "Guided builder for a complete FFmpeg transcode profile.",
+  usage: "Use as a simplified preset builder; it injects full FFmpeg settings into the context.",
+  weight: 0.5,
+  fields: [
+    {
+      key: "container",
+      label: "Container",
+      type: "text",
+      placeholder: "mp4",
+      suggestions: ["mp4", "mkv", "mov", "webm"],
+    },
+    {
+      key: "targetProfile",
+      label: "Target profile",
+      type: "text",
+      placeholder: "jellyfin",
+      suggestions: ["jellyfin", "roku", "samsung", "amazon", "local"],
+    },
+    {
+      key: "useGpu",
+      label: "Use my GPU",
+      type: "checkbox",
+      default: true,
+    },
+    {
+      key: "videoCodec",
+      label: "Video codec",
+      type: "text",
+      placeholder: "h264",
+      suggestions: ["h264", "hevc", "av1"],
+    },
+    {
+      key: "preset",
+      label: "Video preset",
+      type: "text",
+      placeholder: "veryfast",
+      suggestions: [
+        "ultrafast",
+        "superfast",
+        "veryfast",
+        "faster",
+        "fast",
+        "medium",
+        "slow",
+        "slower",
+        "veryslow",
+      ],
+    },
+    {
+      key: "crf",
+      label: "CRF (quality)",
+      type: "number",
+      placeholder: "20",
+    },
+    {
+      key: "bitrateKbps",
+      label: "Video bitrate (kbps)",
+      type: "number",
+      placeholder: "4000",
+    },
+    {
+      key: "audioCodec",
+      label: "Audio codec",
+      type: "text",
+      placeholder: "aac",
+      suggestions: ["aac", "ac3", "eac3", "opus", "mp3", "copy"],
+    },
+    {
+      key: "audioBitrateKbps",
+      label: "Audio bitrate (kbps)",
+      type: "number",
+      placeholder: "192",
+    },
+    {
+      key: "audioChannels",
+      label: "Audio channels",
+      type: "number",
+      placeholder: "2",
+    },
+    {
+      key: "subtitleMode",
+      label: "Subtitles",
+      type: "text",
+      placeholder: "copy",
+      suggestions: ["copy", "none"],
+    },
+    {
+      key: "scaleWidth",
+      label: "Scale width",
+      type: "number",
+      placeholder: "1920",
+    },
+    {
+      key: "scaleHeight",
+      label: "Scale height",
+      type: "number",
+      placeholder: "1080",
+    },
+    {
+      key: "fps",
+      label: "FPS",
+      type: "number",
+      placeholder: "24",
+    },
+    {
+      key: "deinterlace",
+      label: "Deinterlace",
+      type: "checkbox",
+      default: false,
+    },
+    {
+      key: "faststart",
+      label: "Faststart (mp4/mov)",
+      type: "checkbox",
+      default: true,
+    },
+  ],
+  outputs: [{ id: "out", label: "out" }],
+});
+
+export default def;

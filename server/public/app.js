@@ -27,6 +27,7 @@ let appConfig = { debug: false };
 let cachedTrees = [];
 let pendingTreeId = null;
 let treeNodeMenuState = { node: null };
+let treeEdgeMenuState = { edge: null };
 let currentLogJobId = null;
 let currentLogEntries = [];
 let logPollTimer = null;
@@ -267,7 +268,7 @@ async function renderLibraries() {
   const nodeNames = nodes.map((node) => node.name).sort();
 
   view.innerHTML = `
-    <div class="card">
+    <div class="card tree-designer-card">
       <div class="card-header">
         <div>
           <h3>Libraries</h3>
@@ -406,7 +407,8 @@ async function renderNodes() {
                 gpus,
                 isExpanded,
                 node.last_seen,
-                ramDetailText
+                ramDetailText,
+                node.hardware?.ffmpegWarnings ?? []
               );
 
               return `<tr>
@@ -585,7 +587,7 @@ async function renderJobs() {
                             <div class="muted">${job.id}</div>
                           </td>
                           <td>${typeText}</td>
-                          <td>${normalizedStatus}</td>
+                          <td>${formatJobStatus(job, normalizedStatus)}</td>
                           <td>${formatJobProgress(job)}</td>
                           <td>${job.assigned_node_id ?? "-"}</td>
                           <td>${new Date(job.updated_at).toLocaleString()}</td>
@@ -784,20 +786,18 @@ async function renderTrees() {
   const trees = await fetchJson("/api/trees");
 
   view.innerHTML = `
-    <div class="trees-topbar">
-      <div>
-        <h3>Trees</h3>
-        <p class="muted">Select a tree from the sidebar to edit.</p>
-      </div>
-      <button class="primary" id="tree-create">Create Tree</button>
-    </div>
-    <div class="card">
+    <div class="trees-topbar"></div>
+    <div class="card tree-designer-card">
       <div class="card-header">
         <div>
-          <h3>Tree Designer</h3>
+          <div class="tree-designer-title">
+            <h3>Tree Designer</h3>
+            <span class="muted">Select a tree from the sidebar to edit.</span>
+          </div>
           <p class="muted">Drag nodes and connect branches. Save to create a new version.</p>
         </div>
-        <div class="actions">
+        <div class="actions tree-designer-actions">
+          <button class="primary" id="tree-create">Create Tree</button>
           <button class="ghost" id="tree-designer-save" disabled>Save</button>
           <select id="tree-actions" class="tree-actions">
             <option value="">Actions</option>
@@ -879,6 +879,7 @@ async function loadAppConfig() {
   } catch {
     appConfig = appConfig ?? { debug: false };
   }
+  document.body.classList.toggle("debug-mode", Boolean(appConfig?.debug));
 }
 
 function showLoadError(message) {
@@ -1043,12 +1044,17 @@ function renderUsageMeter(value, text, hideText = false) {
   `;
 }
 
-function formatJobProgress(job) {
+function formatJobStatus(job, normalizedStatus) {
+  const status = normalizedStatus ?? normalizeJobStatus(job.status);
   const progressValue = Number(job?.progress ?? 0);
   const percent = Number.isFinite(progressValue) ? Math.round(progressValue) : 0;
-  const fps = extractFps(job?.progress_message);
-  if (fps != null) return `${percent}% • ${formatFps(fps)} fps`;
-  return `${percent}%`;
+  if (status === "processing" && percent > 0) return `${status} ${percent}%`;
+  return status;
+}
+
+function formatJobProgress(job) {
+  const message = String(job?.progress_message ?? "").trim();
+  return message || "-";
 }
 
 function extractFps(message) {
@@ -1128,7 +1134,7 @@ function buildJobCounts(stats) {
 }
 
 
-function renderGpuDetailsRow(nodeId, gpus, expanded, lastSeen, ramDetailText) {
+function renderGpuDetailsRow(nodeId, gpus, expanded, lastSeen, ramDetailText, ffmpegWarnings = []) {
   if (!expanded) {
     return `<tr class="gpu-details hidden" data-gpu-details="${nodeId}"></tr>`;
   }
@@ -1172,6 +1178,11 @@ function renderGpuDetailsRow(nodeId, gpus, expanded, lastSeen, ramDetailText) {
         <div class="gpu-details-meta">
           <div><span class="muted">Last seen:</span> ${new Date(lastSeen).toLocaleString()}</div>
           <div><span class="muted">RAM:</span> ${ramDetailText}</div>
+          ${
+            Array.isArray(ffmpegWarnings) && ffmpegWarnings.length
+              ? `<div><span class="muted">FFmpeg warnings:</span> ${ffmpegWarnings.join(", ")}</div>`
+              : ""
+          }
         </div>
         <table class="table subtable">
           <thead>
@@ -1188,14 +1199,13 @@ function renderGpuDetailsRow(nodeId, gpus, expanded, lastSeen, ramDetailText) {
 
 async function startAutoRefresh() {
   const token = ++refreshToken;
-  const waitMs = 1500;
 
   while (token === refreshToken) {
     try {
       if (!isUserEditing()) {
         if (activeView === "trees") {
           await renderSidebarLists();
-          await new Promise((resolve) => setTimeout(resolve, waitMs));
+          await new Promise((resolve) => setTimeout(resolve, getAutoRefreshInterval()));
           continue;
         }
         const scrollTop = view.scrollTop;
@@ -1207,8 +1217,15 @@ async function startAutoRefresh() {
       console.warn("Auto-refresh failed:", err.message ?? err);
     }
 
-    await new Promise((resolve) => setTimeout(resolve, waitMs));
+    await new Promise((resolve) => setTimeout(resolve, getAutoRefreshInterval()));
   }
+}
+
+function getAutoRefreshInterval() {
+  if (document?.hidden) return 8000;
+  if (activeView === "jobs") return 4000;
+  if (activeView === "nodes") return 3000;
+  return 1500;
 }
 
 async function renderSidebarLists() {
@@ -1634,12 +1651,18 @@ function renderLogModal() {
   if (document.getElementById("log-modal-backdrop")) {
     return "";
   }
+  const clearButton = appConfig?.debug
+    ? `<button class="danger" id="log-modal-clear">Clear logs</button>`
+    : "";
   return `
     <div class="modal-backdrop hidden" id="log-modal-backdrop">
       <div class="modal log-modal">
         <div class="modal-header">
           <h3 id="log-modal-title">Job Logs</h3>
-          <button class="ghost" id="log-modal-close">Close</button>
+          <div class="modal-actions">
+            ${clearButton}
+            <button class="ghost" id="log-modal-close">Close</button>
+          </div>
         </div>
         <div class="log-meta" id="log-meta">
           <div class="log-meta-header">
@@ -1777,6 +1800,18 @@ function openLogModal(job) {
     document.body.appendChild(backdrop);
   }
 
+  if (appConfig?.debug) {
+    const header = backdrop.querySelector(".modal-header");
+    const actions = header?.querySelector(".modal-actions");
+    if (actions && !actions.querySelector("#log-modal-clear")) {
+      const clearBtn = document.createElement("button");
+      clearBtn.className = "danger";
+      clearBtn.id = "log-modal-clear";
+      clearBtn.textContent = "Clear logs";
+      actions.prepend(clearBtn);
+    }
+  }
+
   currentLogJobId = job?.id ?? null;
   lastLogSnapshot = job?.log_text ?? "";
   lastLogStatus = job?.status ?? "";
@@ -1790,6 +1825,7 @@ function openLogModal(job) {
     metaBody.classList.add("collapsed");
     metaToggle.setAttribute("aria-expanded", "false");
   }
+  bindLogModal();
   startLogPolling();
 }
 
@@ -1940,6 +1976,8 @@ function bindLogModal() {
   const content = document.getElementById("log-content");
   const metaToggle = document.getElementById("log-meta-toggle");
   const metaBody = document.getElementById("log-meta-body");
+  if (!backdrop || backdrop.dataset.bound === "true") return;
+  backdrop.dataset.bound = "true";
 
   closeBtn?.addEventListener("click", (event) => {
     event.preventDefault();
@@ -1956,6 +1994,37 @@ function bindLogModal() {
     metaToggle.setAttribute("aria-expanded", String(!isCollapsed));
   });
 
+  backdrop.addEventListener("click", async (event) => {
+    const target = event.target.closest("#log-modal-clear");
+    if (!target) return;
+    event.preventDefault();
+    if (!currentLogJobId) return;
+    if (!confirm("Clear all logs for this job?")) return;
+    try {
+      const res = await fetch(`/api/jobs/${currentLogJobId}/clear-log`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+      });
+      if (!res.ok) {
+        const message = await res.text();
+        alert(message || "Failed to clear logs.");
+        return;
+      }
+      lastLogSnapshot = "";
+      lastLogStatus = "";
+      updateLogModal({
+        id: currentLogJobId,
+        type: "unknown",
+        status: "",
+        log_text: "",
+      });
+      const job = await fetchJson(`/api/jobs/${currentLogJobId}`);
+      updateLogModal(job);
+    } catch {
+      alert("Failed to clear logs.");
+    }
+  });
+
   list?.addEventListener("click", (event) => {
     const target = event.target.closest("button[data-log-index]");
     if (!target) return;
@@ -1969,6 +2038,68 @@ function bindLogModal() {
 
     content.innerHTML = renderLogContent(entry.message ?? "(no log)");
   });
+
+  list?.addEventListener("contextmenu", async (event) => {
+    const target = event.target.closest("button[data-log-index]");
+    if (!target) return;
+    event.preventDefault();
+    const index = Number(target.dataset.logIndex);
+    const entry = currentLogEntries[index];
+    if (!entry) return;
+    const ok = await copyTextToClipboard(entry.message ?? "");
+    showToast(ok ? "Log copied to clipboard" : "Copy failed", ok ? "success" : "error");
+  });
+}
+
+async function copyTextToClipboard(text) {
+  const value = String(text ?? "");
+  if (!value) return false;
+  try {
+    if (navigator?.clipboard?.writeText) {
+      await navigator.clipboard.writeText(value);
+      return true;
+    }
+  } catch {
+    // fallback below
+  }
+  try {
+    const textarea = document.createElement("textarea");
+    textarea.value = value;
+    textarea.setAttribute("readonly", "readonly");
+    textarea.style.position = "fixed";
+    textarea.style.opacity = "0";
+    textarea.style.pointerEvents = "none";
+    document.body.appendChild(textarea);
+    textarea.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(textarea);
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
+function showToast(message, variant = "info") {
+  const text = String(message ?? "").trim();
+  if (!text) return;
+
+  let container = document.getElementById("toast-container");
+  if (!container) {
+    container = document.createElement("div");
+    container.id = "toast-container";
+    container.setAttribute("aria-live", "polite");
+    container.setAttribute("aria-atomic", "true");
+    document.body.appendChild(container);
+  }
+
+  const toast = document.createElement("div");
+  toast.className = `toast toast-${variant}`;
+  toast.textContent = text;
+  container.appendChild(toast);
+
+  const ttl = 2000;
+  setTimeout(() => toast.classList.add("hide"), ttl);
+  setTimeout(() => toast.remove(), ttl + 300);
 }
 
 function renderLogContent(message) {
@@ -2340,6 +2471,7 @@ function ensureTreeNodeMenu() {
   menu.className = "tree-context-menu hidden";
   menu.innerHTML = `
     <button class="ghost" data-action="config">Configure</button>
+    <button class="ghost" data-action="clear-connections">Clear connections</button>
     <button class="danger" data-action="delete">Delete</button>
   `;
   document.body.appendChild(menu);
@@ -2356,6 +2488,14 @@ function ensureTreeNodeMenu() {
       const nodeId = treeNodeMenuState.node?.id ?? treeNodeMenuState.node?.data?.__nodeId;
       if (nodeId && typeof treeDesignerState.deleteNode === "function") {
         treeDesignerState.deleteNode(nodeId);
+      }
+      closeTreeNodeMenu();
+      return;
+    }
+    if (action === "clear-connections") {
+      const nodeId = treeNodeMenuState.node?.id ?? treeNodeMenuState.node?.data?.__nodeId;
+      if (nodeId && typeof treeDesignerState.clearNodeConnections === "function") {
+        treeDesignerState.clearNodeConnections(nodeId);
       }
       closeTreeNodeMenu();
     }
@@ -2389,6 +2529,59 @@ function closeTreeNodeMenu() {
   if (!menu) return;
   menu.classList.add("hidden");
   treeNodeMenuState.node = null;
+}
+
+function ensureTreeEdgeMenu() {
+  let menu = document.getElementById("tree-edge-menu");
+  if (menu) return menu;
+  menu = document.createElement("div");
+  menu.id = "tree-edge-menu";
+  menu.className = "tree-context-menu hidden";
+  menu.innerHTML = `
+    <button class="ghost" data-action="delete-edge">Clear connection</button>
+  `;
+  document.body.appendChild(menu);
+
+  menu.addEventListener("click", (event) => {
+    const action = event.target.closest("button")?.dataset.action;
+    if (!action || !treeEdgeMenuState.edge) return;
+    if (action === "delete-edge") {
+      const edgeId = treeEdgeMenuState.edge?.id;
+      if (edgeId && typeof treeDesignerState.deleteEdge === "function") {
+        treeDesignerState.deleteEdge(edgeId);
+      }
+      closeTreeEdgeMenu();
+    }
+  });
+
+  document.addEventListener("click", (event) => {
+    if (!menu.classList.contains("hidden") && !menu.contains(event.target)) {
+      closeTreeEdgeMenu();
+    }
+  });
+
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") closeTreeEdgeMenu();
+  });
+
+  return menu;
+}
+
+function openTreeEdgeMenu(position, edge) {
+  const menu = ensureTreeEdgeMenu();
+  const x = Math.max(8, position.x ?? 0);
+  const y = Math.max(8, position.y ?? 0);
+  menu.style.left = `${x}px`;
+  menu.style.top = `${y}px`;
+  menu.classList.remove("hidden");
+  treeEdgeMenuState.edge = edge;
+}
+
+function closeTreeEdgeMenu() {
+  const menu = document.getElementById("tree-edge-menu");
+  if (!menu) return;
+  menu.classList.add("hidden");
+  treeEdgeMenuState.edge = null;
 }
 
 function closeTreeSettingsModal() {
@@ -2797,9 +2990,22 @@ function mountTreeDesigner(tree) {
   const useNodesState = window.ReactFlow.useNodesState;
   const useEdgesState = window.ReactFlow.useEdgesState;
   const useReactFlow = window.ReactFlow.useReactFlow;
+  const useUpdateNodeInternals = window.ReactFlow.useUpdateNodeInternals;
   const Handle = window.ReactFlow.Handle;
   const Position = window.ReactFlow.Position;
   const ReactFlowProvider = window.ReactFlow.ReactFlowProvider;
+
+  const categorizeElement = (item) => {
+    const type = String(item?.type ?? "").toLowerCase();
+    if (type === "input") return "Inputs";
+    if (type.startsWith("ffmpeg_")) return "FFmpeg";
+    if (type.includes("verify") || type.includes("integrity")) return "Validation";
+    if (type.includes("replace") || type.includes("move_output")) return "File Actions";
+    if (type.includes("fail") || type.includes("complete") || type.includes("requeue")) {
+      return "Job Control";
+    }
+    return "Other";
+  };
 
   const initialGraph = tree?.graph ? JSON.parse(tree.graph) : null;
   const initialNodes = (initialGraph?.nodes ?? []).map((node, index) =>
@@ -2810,15 +3016,30 @@ function mountTreeDesigner(tree) {
           node?.position && typeof node.position.x === "number" && typeof node.position.y === "number"
             ? node.position
             : { x: 80 + index * 40, y: 80 + index * 40 },
+        targetPosition: Position.Top,
+        sourcePosition: Position.Bottom,
       },
       TREE_ELEMENT_DEFS
     )
   );
-  const initialEdges = initialGraph?.edges ?? [];
+  const initialEdges = (initialGraph?.edges ?? []).map((edge) => {
+    const targetNode = initialNodes.find((node) => node.id === edge.target);
+    const isInputTarget = targetNode?.data?.elementType === "input";
+    return {
+      ...edge,
+      targetHandle: isInputTarget ? edge.targetHandle : "in",
+    };
+  });
 
   const TreeNode = ({ data, id }) => {
+    const updateNodeInternals = useUpdateNodeInternals();
+    React.useEffect(() => {
+      updateNodeInternals(id);
+    }, [id, data?.label, data?.elementType, data?.outputs?.length, updateNodeInternals]);
     const outputs = data?.outputs ?? [];
     const elementType = data?.elementType;
+    const hideDefaultHandle =
+      elementType === "input" || elementType === "complete_job" || elementType === "fail_job";
     return React.createElement(
       "div",
       {
@@ -2843,22 +3064,37 @@ function mountTreeDesigner(tree) {
       ),
       elementType === "input"
         ? null
-        : React.createElement(Handle, { type: "target", position: Position.Top, id: "in" }),
+        : React.createElement(Handle, {
+            type: "target",
+            position: Position.Top,
+            id: "in",
+            className: "tree-node-handle tree-node-handle-target",
+            "data-label": "in",
+            title: "in",
+          }),
       outputs.map((output, index) =>
         React.createElement(Handle, {
           key: output.id,
           type: "source",
           position: Position.Bottom,
           id: output.id,
-          style: { left: 12 + index * 18 },
+          className: "tree-node-handle tree-node-handle-source",
+          style: { bottom: 0, left: 12 + index * 18, transform: "translateY(50%)" },
+          "data-label": output.label ?? output.id ?? "out",
+          title: output.label ?? output.id ?? "out",
         })
       ),
-      React.createElement(Handle, {
-        type: "source",
-        position: Position.Right,
-        id: "default",
-        className: "tree-node-default-handle",
-      })
+      hideDefaultHandle
+        ? null
+        : React.createElement(Handle, {
+            type: "source",
+            position: Position.Right,
+            id: "default",
+            className: "tree-node-handle tree-node-default-handle",
+            style: { right: 0, top: "50%", transform: "translate(50%, -50%)" },
+            "data-label": "default",
+            title: "default",
+          })
     );
   };
 
@@ -2866,15 +3102,25 @@ function mountTreeDesigner(tree) {
     const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
     const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
     const [dirty, setDirty] = React.useState(false);
-    const { screenToFlowPosition } = useReactFlow();
+    const { screenToFlowPosition, fitView } = useReactFlow();
     const lastClickRef = React.useRef({ nodeId: null, time: 0 });
     const lastPointerRef = React.useRef({ nodeId: null, time: 0 });
+    const didFitRef = React.useRef(false);
 
     React.useEffect(() => {
       setNodes(initialNodes);
       setEdges(initialEdges);
       setDirty(false);
+      didFitRef.current = false;
     }, [tree?.id]);
+
+    React.useEffect(() => {
+      if (didFitRef.current || !nodes.length) return;
+      didFitRef.current = true;
+      requestAnimationFrame(() => {
+        fitView({ padding: 0.2, duration: 300 });
+      });
+    }, [nodes.length, fitView]);
 
     React.useEffect(() => {
       treeDesignerState.getNode = (nodeId) => nodes.find((node) => node.id === nodeId);
@@ -2927,10 +3173,39 @@ function mountTreeDesigner(tree) {
 
     const onConnect = React.useCallback(
       (params) => {
-        setEdges((eds) => addEdge(params, eds));
+        const targetHandle = params.targetHandle ?? "in";
+        const sourceHandle = params.sourceHandle ?? "default";
+        const targetNode = nodes.find((node) => node.id === params.target);
+        const targetType = targetNode?.data?.elementType;
+        const allowMultiInput = targetType === "complete_job" || targetType === "fail_job";
+        setEdges((eds) => {
+          let nextEdges = eds;
+          if (!allowMultiInput) {
+            nextEdges = nextEdges.filter(
+              (edge) =>
+                !(
+                  edge.target === params.target &&
+                  (edge.targetHandle ?? "in") === targetHandle
+                )
+            );
+          }
+          nextEdges = nextEdges.filter(
+            (edge) =>
+              !(
+                edge.source === params.source &&
+                (edge.sourceHandle ?? "default") === sourceHandle
+              )
+          );
+          const next = {
+            ...params,
+            targetHandle,
+            sourceHandle,
+          };
+          return addEdge(next, nextEdges);
+        });
         setDirty(true);
       },
-      []
+      [nodes]
     );
 
     const addNode = (elementType, position) => {
@@ -2947,6 +3222,8 @@ function mountTreeDesigner(tree) {
           id,
           type: "treeNode",
           position: position ?? { x: 50 + nds.length * 40, y: 50 + nds.length * 40 },
+          targetPosition: Position.Top,
+          sourcePosition: Position.Bottom,
           data: {
             label: def.label,
             elementType: def.type,
@@ -2998,10 +3275,24 @@ function mountTreeDesigner(tree) {
       openTreeNodeMenu({ x: event.clientX, y: event.clientY }, node);
     }, []);
 
+    const onEdgeContextMenu = React.useCallback((event, edge) => {
+      event.preventDefault();
+      openTreeEdgeMenu({ x: event.clientX, y: event.clientY }, edge);
+    }, []);
+
     const saveGraph = React.useCallback(
       async (graphNodes, graphEdges) => {
         if (!tree?.id) return;
-        const graph = { version: 1, nodes: graphNodes, edges: graphEdges };
+        const edgeNodes = new Map(graphNodes.map((node) => [node.id, node]));
+        const edges = graphEdges.map((edge) => {
+          const targetNode = edgeNodes.get(edge.target);
+          const isInputTarget = targetNode?.data?.elementType === "input";
+          return {
+            ...edge,
+            targetHandle: isInputTarget ? edge.targetHandle : "in",
+          };
+        });
+        const graph = { version: 1, nodes: graphNodes, edges };
         const res = await fetch(`/api/trees/${tree.id}/versions`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -3057,6 +3348,22 @@ function mountTreeDesigner(tree) {
       [setNodes, setEdges]
     );
 
+    const deleteEdge = React.useCallback(
+      (edgeId) => {
+        setEdges((eds) => eds.filter((e) => e.id !== edgeId));
+        setDirty(true);
+      },
+      [setEdges]
+    );
+
+    const clearNodeConnections = React.useCallback(
+      (nodeId) => {
+        setEdges((eds) => eds.filter((e) => e.source !== nodeId && e.target !== nodeId));
+        setDirty(true);
+      },
+      [setEdges]
+    );
+
     const save = async () => {
       await saveGraph(nodes, edges);
     };
@@ -3067,12 +3374,14 @@ function mountTreeDesigner(tree) {
       treeDesignerState.isDirty = dirty;
       treeDesignerState.updateNodeConfig = updateNodeConfig;
       treeDesignerState.deleteNode = deleteNode;
+      treeDesignerState.deleteEdge = deleteEdge;
+      treeDesignerState.clearNodeConnections = clearNodeConnections;
       const saveBtn = document.getElementById("tree-designer-save");
       if (saveBtn) {
         saveBtn.disabled = !treeDesignerState.treeId || !dirty;
         saveBtn.textContent = dirty ? "Save changes" : "Saved";
       }
-    }, [dirty, tree?.id, updateNodeConfig, deleteNode]);
+    }, [dirty, tree?.id, updateNodeConfig, deleteNode, deleteEdge, clearNodeConnections]);
 
     return React.createElement(
       "div",
@@ -3102,8 +3411,13 @@ function mountTreeDesigner(tree) {
               onNodeDoubleClick,
               onNodeClick,
               onNodeContextMenu,
+              onEdgeContextMenu,
               nodeTypes: { treeNode: TreeNode },
-              defaultEdgeOptions: { type: "step" },
+              defaultEdgeOptions: {
+                type: "step",
+                animated: true,
+                style: { stroke: "#6d7dff", strokeWidth: 2 },
+              },
               fitView: true,
               zoomOnDoubleClick: false,
               nodeDragThreshold: 6,
@@ -3111,27 +3425,48 @@ function mountTreeDesigner(tree) {
             },
             React.createElement(Background, { gap: 16 }),
             React.createElement(Controls),
-            React.createElement(MiniMap)
+            React.createElement(MiniMap, { zoomable: true, pannable: true })
           )
         ),
         React.createElement(
           "div",
           { className: "tree-designer-palette" },
-          TREE_ELEMENT_DEFS.filter((item) => !item.debugOnly || appConfig?.debug).map((item) =>
-            React.createElement(
-              "div",
-              {
-                key: item.type,
-                className: "tree-palette-item",
-                draggable: true,
-                onDragStart: (event) => {
-                  event.dataTransfer.setData("application/reactflow", item.type);
-                  event.dataTransfer.effectAllowed = "move";
-                },
-              },
-              item.label
-            )
-          )
+          (() => {
+            const visible = TREE_ELEMENT_DEFS.filter(
+              (item) => !item.debugOnly || appConfig?.debug
+            );
+            const groups = new Map();
+            visible.forEach((item) => {
+              const key = categorizeElement(item);
+              if (!groups.has(key)) groups.set(key, []);
+              groups.get(key).push(item);
+            });
+            const order = ["Inputs", "FFmpeg", "Validation", "File Actions", "Job Control", "Other"];
+            return order
+              .filter((key) => groups.has(key))
+              .flatMap((key) => [
+                React.createElement(
+                  "div",
+                  { key: `${key}-header`, className: "tree-palette-group" },
+                  React.createElement("div", { className: "tree-palette-title" }, key)
+                ),
+                ...groups.get(key).map((item) =>
+                  React.createElement(
+                    "div",
+                    {
+                      key: item.type,
+                      className: "tree-palette-item",
+                      draggable: true,
+                      onDragStart: (event) => {
+                        event.dataTransfer.setData("application/reactflow", item.type);
+                        event.dataTransfer.effectAllowed = "move";
+                      },
+                    },
+                    item.label
+                  )
+                ),
+              ]);
+          })()
         )
       )
     );

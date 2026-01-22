@@ -7,9 +7,13 @@ import { def as ffmpegSetContainer } from "./elements/ffmpeg-set-container.js";
 import { def as ffmpegSetVideo } from "./elements/ffmpeg-set-video.js";
 import { def as ffmpegSetAudio } from "./elements/ffmpeg-set-audio.js";
 import { def as ffmpegHwaccel } from "./elements/ffmpeg-hwaccel.js";
+import { def as ffmpegWizard } from "./elements/ffmpeg-wizard.js";
+import { def as ffmpegSubtitles } from "./elements/ffmpeg-subtitles.js";
+import { def as ffmpegFilters } from "./elements/ffmpeg-filters.js";
 import { def as ffmpegExecute } from "./elements/ffmpeg-execute.js";
 import { def as verifyIntegrity } from "./elements/verify-integrity.js";
 import { def as replaceOriginal } from "./elements/replace-original.js";
+import { def as moveOutputFile } from "./elements/move-output-file.js";
 import { def as failJob } from "./elements/fail-job.js";
 import { def as completeJob } from "./elements/complete-job.js";
 import { def as requeueJob } from "./elements/requeue-job.js";
@@ -24,9 +28,13 @@ export const TREE_ELEMENT_DEFS = [
   ffmpegSetVideo,
   ffmpegSetAudio,
   ffmpegHwaccel,
+  ffmpegWizard,
+  ffmpegSubtitles,
+  ffmpegFilters,
   ffmpegExecute,
   verifyIntegrity,
   replaceOriginal,
+  moveOutputFile,
   failJob,
   completeJob,
   requeueJob,

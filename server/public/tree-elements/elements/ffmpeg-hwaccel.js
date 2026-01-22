@@ -5,6 +5,7 @@ export const def = createElementDef({
   label: "HW Accel Device",
   description: "Sets the hardware acceleration device to use in FFmpeg.",
   usage: "Common values: cuda, qsv, vaapi, videotoolbox.",
+  weight: 0.5,
   fields: [
     {
       key: "device",

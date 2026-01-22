@@ -1,15 +1,20 @@
-import axios from "axios";
 import fs from "fs/promises";
 import path from "path";
 import { fileURLToPath } from "url";
 import { config } from "./config.js";
 import { collectMetrics, detectPlatform, getHardwareInfo, startMetricsMonitor } from "./hardware.js";
 import { runJob } from "./jobs/engine.js";
+import { httpClient } from "./httpClient.js";
+import { initFileLogger } from "./logger.js";
 
 const metricsMonitor = startMetricsMonitor(5000);
+const TEMP_DIR_PREFIX = "codarr_";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const pluginsDir = path.join(__dirname, "tree-elements", "plugins");
 const remoteElementsDir = path.join(__dirname, "tree-elements", "remote");
+const logFile = process.env.CODARR_NODE_LOG_FILE ?? path.join(__dirname, "..", "logs", "node.log");
+
+initFileLogger(logFile);
 const lastJobStart = new Map();
 const activeJobs = new Map();
 const activeCounts = {
@@ -18,32 +23,63 @@ const activeCounts = {
 };
 let nodeSettings = {};
 let lastSettingsFetch = 0;
+let warnedPerfCounters = false;
 
 async function getMetrics() {
   return metricsMonitor.getLatest() ?? collectMetrics();
 }
 
 async function registerNode() {
+  console.log("[startup] Collecting metrics for registration...");
   const metrics = await getMetrics();
+  console.log("[startup] Metrics collected.");
+  console.log("[startup] Collecting hardware inventory...");
   const hardware = await getHardwareInfo();
+  console.log("[startup] Hardware inventory collected.");
   if (!config.nodeId || !config.nodeName || !process.platform || !metrics) {
     throw new Error("Missing node identity or metrics for registration");
   }
-  await axios.post(`${config.serverUrl}/api/nodes/register`, {
-    id: config.nodeId,
-    name: config.nodeName,
-    platform: detectPlatform(),
-    metrics,
-    hardware,
-    tags: config.nodeTags,
-    jobs: Array.from(activeJobs.keys()),
-  });
+  logResourceUsage("register", metrics);
+  console.log("[startup] Sending register request...");
+  await httpClient.post(
+    `${config.serverUrl}/api/nodes/register`,
+    {
+      id: config.nodeId,
+      name: config.nodeName,
+      platform: detectPlatform(),
+      metrics,
+      hardware,
+      tags: config.nodeTags,
+      jobs: Array.from(activeJobs.keys()),
+    },
+    { timeout: 30000 }
+  );
+}
+
+async function cleanupTempDirOnStart() {
+  if (!config.tempDir) return;
+  try {
+    const entries = await fs.readdir(config.tempDir, { withFileTypes: true });
+    const targets = entries.filter(
+      (entry) => entry.isDirectory() && entry.name.startsWith(TEMP_DIR_PREFIX)
+    );
+    await Promise.all(
+      targets.map((entry) =>
+        fs.rm(path.join(config.tempDir, entry.name), { recursive: true, force: true })
+      )
+    );
+    if (targets.length) {
+      console.log(`Cleaned ${targets.length} temp folder(s) in ${config.tempDir}`);
+    }
+  } catch (error) {
+    console.warn(`Temp dir cleanup failed: ${error?.message ?? error}`);
+  }
 }
 
 async function deregisterNode() {
   if (!config.nodeId) return;
   try {
-    await axios.post(`${config.serverUrl}/api/nodes/deregister`, {
+    await httpClient.post(`${config.serverUrl}/api/nodes/deregister`, {
       id: config.nodeId,
       jobs: Array.from(activeJobs.keys()),
     });
@@ -58,8 +94,11 @@ function logAxiosError(prefix, err) {
   const data = err?.response?.data;
   const message = err?.message ?? String(err);
   const details = status ? `${status} ${statusText ?? ""}`.trim() : "no response";
+  const method = err?.config?.method?.toUpperCase?.() ?? "";
+  const url = err?.config?.url ?? "";
+  const code = err?.code ? ` ${err.code}` : "";
 
-  console.error(`${prefix}: ${message} (${details})`);
+  console.error(`${prefix}: ${message} (${details})${code} ${method} ${url}`.trim());
   if (data) {
     console.error(`${prefix} response:`, data);
   }
@@ -68,6 +107,9 @@ function logAxiosError(prefix, err) {
 async function retryRegister() {
   while (true) {
     try {
+      console.log("[startup] Cleaning temp directories...");
+      await cleanupTempDirOnStart();
+      console.log("[startup] Temp cleanup complete.");
       await registerNode();
       console.log(`Registered node ${config.nodeName} (${config.nodeId}).`);
       return;
@@ -79,6 +121,7 @@ async function retryRegister() {
 }
 
 function startSafeInterval(fn, intervalMs, name) {
+  fn().catch((err) => logAxiosError(`${name} failed`, err));
   return setInterval(() => {
     fn().catch((err) => logAxiosError(`${name} failed`, err));
   }, intervalMs);
@@ -86,11 +129,16 @@ function startSafeInterval(fn, intervalMs, name) {
 
 async function heartbeat() {
   const metrics = await getMetrics();
-  await axios.post(`${config.serverUrl}/api/nodes/heartbeat`, {
-    id: config.nodeId,
-    metrics,
-    jobs: Array.from(activeJobs.keys()),
-  });
+  logResourceUsage("heartbeat", metrics);
+  await httpClient.post(
+    `${config.serverUrl}/api/nodes/heartbeat`,
+    {
+      id: config.nodeId,
+      metrics,
+      jobs: Array.from(activeJobs.keys()),
+    },
+    { timeout: 30000 }
+  );
 }
 
 async function pollJobs() {
@@ -99,6 +147,7 @@ async function pollJobs() {
   await refreshNodeSettings();
   const settings = nodeSettings ?? {};
   const metrics = await getMetrics();
+  logResourceUsage("poll", metrics);
   const cpuLoad = Number(metrics?.cpu?.load ?? 0);
   const gpuMetrics = metrics?.gpus ?? [];
   const gpuLoad = averageGpuUtil(gpuMetrics);
@@ -163,21 +212,25 @@ async function pollJobs() {
       })
     : 0;
 
-  const { data } = await axios.post(`${config.serverUrl}/api/jobs/next`, {
-    nodeId: config.nodeId,
-    slots: {
-      cpu: clampSlots(config.jobSlotsCpu, activeCpuTotal),
-      gpu: allowTranscode ? clampSlots(config.jobSlotsGpu, activeGpuTotal) : 0,
-      healthcheckCpu: healthcheckCpuSlots,
-      healthcheckGpu: healthcheckGpuSlots.count,
-      healthcheckGpuIndices: healthcheckGpuSlots.indices,
-      transcodeCpu: transcodeCpuSlots,
-      transcodeGpu: transcodeGpuSlots.count,
-      transcodeGpuIndices: transcodeGpuSlots.indices,
+  const { data } = await httpClient.post(
+    `${config.serverUrl}/api/jobs/next`,
+    {
+      nodeId: config.nodeId,
+      slots: {
+        cpu: clampSlots(config.jobSlotsCpu, activeCpuTotal),
+        gpu: allowTranscode ? clampSlots(config.jobSlotsGpu, activeGpuTotal) : 0,
+        healthcheckCpu: healthcheckCpuSlots,
+        healthcheckGpu: healthcheckGpuSlots.count,
+        healthcheckGpuIndices: healthcheckGpuSlots.indices,
+        transcodeCpu: transcodeCpuSlots,
+        transcodeGpu: transcodeGpuSlots.count,
+        transcodeGpuIndices: transcodeGpuSlots.indices,
+      },
+      accelerators: allowTranscode ? detectAccelerators() : ["cpu"],
+      allowTranscode,
     },
-    accelerators: allowTranscode ? detectAccelerators() : ["cpu"],
-    allowTranscode,
-  });
+    { timeout: 30000 }
+  );
 
   const jobs = data.jobs ?? (data.job ? [data.job] : []);
   if (!jobs.length) return;
@@ -193,64 +246,16 @@ async function pollJobs() {
   }
 }
 
-async function syncPlugins() {
+async function cleanupElementCacheOnStart() {
   try {
-    const { data: files } = await axios.get(`${config.serverUrl}/api/trees/plugins`);
-    if (!Array.isArray(files)) return;
-    await fs.mkdir(pluginsDir, { recursive: true });
-
-    for (const file of files) {
-      if (!String(file).endsWith(".js")) continue;
-      try {
-        const { data: code } = await axios.get(`${config.serverUrl}/api/trees/plugins/${file}`);
-        if (typeof code !== "string") continue;
-        const filePath = path.join(pluginsDir, file);
-        const didWrite = await writeIfChanged(filePath, code);
-        if (!didWrite) continue;
-      } catch (error) {
-        console.warn(`Plugin sync failed for ${file}:`, error?.message ?? error);
-      }
-    }
+    await fs.rm(remoteElementsDir, { recursive: true, force: true });
+    await fs.rm(pluginsDir, { recursive: true, force: true });
   } catch (error) {
-    console.warn(`Plugin sync failed:`, error?.message ?? error);
+    console.warn(`Element cache cleanup failed: ${error?.message ?? error}`);
   }
 }
 
-async function syncBaseElements() {
-  try {
-    const { data: files } = await axios.get(`${config.serverUrl}/api/trees/elements`);
-    if (!Array.isArray(files)) return;
-    await fs.mkdir(remoteElementsDir, { recursive: true });
-
-    for (const file of files) {
-      if (!String(file).endsWith(".js")) continue;
-      try {
-        const { data: code } = await axios.get(`${config.serverUrl}/api/trees/elements/${file}`);
-        if (typeof code !== "string") continue;
-        const filePath = path.join(remoteElementsDir, file);
-        const didWrite = await writeIfChanged(filePath, code);
-        if (!didWrite) continue;
-      } catch (error) {
-        console.warn(`Element sync failed for ${file}:`, error?.message ?? error);
-      }
-    }
-  } catch (error) {
-    console.warn(`Element sync failed:`, error?.message ?? error);
-  }
-}
-
-async function writeIfChanged(filePath, content) {
-  try {
-    const existing = await fs.readFile(filePath, "utf8");
-    if (existing === content) return false;
-  } catch (error) {
-    if (error?.code !== "ENOENT") {
-      throw error;
-    }
-  }
-  await fs.writeFile(filePath, content, "utf8");
-  return true;
-}
+// writeIfChanged removed (element sync no longer used)
 
 function detectAccelerators() {
   const accelerators = ["cpu"];
@@ -275,12 +280,61 @@ function averageGpuUtil(gpus = []) {
   return values.reduce((sum, value) => sum + value, 0) / values.length;
 }
 
+function logResourceUsage(source, metrics) {
+  const cpuLoad = Number(metrics?.cpu?.load ?? 0);
+  const memUsed = Number(metrics?.memory?.usedPercent ?? 0);
+  const gpus = Array.isArray(metrics?.gpus) ? metrics.gpus : [];
+  const gpuLoad = averageGpuUtil(gpus);
+  const gpuWorkload = metrics?.gpuWorkload ?? null;
+  const gpuSummary = gpus
+    .map((gpu, index) => {
+      const util = Number(gpu.utilization ?? gpu.utilizationGpu);
+      const mem = Number(gpu.memoryUtilization ?? gpu.vramUsage ?? gpu.vram_usage ?? NaN);
+      const model = gpu.model ?? gpu.vendor ?? `gpu${index}`;
+      const utilText = Number.isFinite(util) ? util.toFixed(1) : "-";
+      const memText = Number.isFinite(mem) ? mem.toFixed(1) : "-";
+      return `${model} util=${utilText}% vram=${memText}%`;
+    })
+    .join(" | ");
+
+  const workloadText = gpuWorkload
+    ? `workload enc=${formatPct(gpuWorkload.encodeLoad)} dec=${formatPct(gpuWorkload.decodeLoad)} proc=${formatPct(gpuWorkload.processLoad)} vram=${formatPct(gpuWorkload.vramUsage)} vendor=${gpuWorkload.vendor ?? "-"}`
+    : "workload -";
+
+  console.log(
+    `[metrics:${source}] cpu=${cpuLoad.toFixed(1)}% mem=${memUsed.toFixed(1)}% gpuAvg=${gpuLoad.toFixed(1)}% ${gpuSummary || "gpu -"} ${workloadText}`
+  );
+
+  warnPerfCountersIfNeeded(gpuWorkload);
+}
+
+function warnPerfCountersIfNeeded(workload) {
+  if (warnedPerfCounters) return;
+  if (process.platform !== "win32") return;
+  if (!workload) return;
+  const hasEncDec = Number.isFinite(Number(workload.encodeLoad)) || Number.isFinite(Number(workload.decodeLoad));
+  const typeperfRaw = workload.raw?.typeperf ?? null;
+  const samples = Array.isArray(workload.raw?.samples) ? workload.raw.samples : [];
+  if (hasEncDec || typeperfRaw || samples.length > 0) return;
+
+  warnedPerfCounters = true;
+  console.warn(
+    "GPU engine counters unavailable. Run the node elevated or add the user to 'Performance Log Users' to access \\\\GPU Engine(*)\\\\Utilization Percentage counters."
+  );
+}
+
+function formatPct(value) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return "-";
+  return `${num.toFixed(1)}%`;
+}
+
 async function refreshNodeSettings() {
   const now = Date.now();
   if (now - lastSettingsFetch < 15000) return;
   lastSettingsFetch = now;
   try {
-    const { data } = await axios.get(`${config.serverUrl}/api/nodes/${config.nodeId}/settings`);
+    const { data } = await httpClient.get(`${config.serverUrl}/api/nodes/${config.nodeId}/settings`, { timeout: 30000 });
     nodeSettings = data?.settings ?? {};
   } catch {
     nodeSettings = nodeSettings ?? {};
@@ -356,12 +410,9 @@ async function start() {
   } else if (!config.enableTranscode) {
     console.warn("Transcode processing disabled (CODARR_ENABLE_TRANSCODE=false).");
   }
-  await syncPlugins();
-  await syncBaseElements();
+  await cleanupElementCacheOnStart();
   startSafeInterval(heartbeat, 5000, "Heartbeat");
   startSafeInterval(pollJobs, 4000, "Job poll");
-  startSafeInterval(syncPlugins, 15000, "Plugin sync");
-  startSafeInterval(syncBaseElements, 15000, "Element sync");
 }
 
 function setupShutdownHandlers() {

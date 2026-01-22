@@ -5,6 +5,7 @@ export const def = createElementDef({
   label: "Set Container",
   description: "Overrides the output container for the FFmpeg pipeline.",
   usage: "Set to mkv, mp4, mov, etc.",
+  weight: 0.5,
   fields: [
     {
       key: "container",
@@ -13,6 +14,12 @@ export const def = createElementDef({
       placeholder: "mp4",
       regex: "^[a-zA-Z0-9]+$",
       suggestions: ["mkv", "mp4", "mov", "webm"],
+    },
+    {
+      key: "faststart",
+      label: "Faststart (mp4/mov)",
+      type: "checkbox",
+      default: false,
     },
   ],
   outputs: [{ id: "out", label: "out" }],
@@ -25,6 +32,12 @@ export default {
     const config = node?.data?.config ?? {};
     context.ffmpeg = context.ffmpeg ?? {};
     if (config.container) context.ffmpeg.container = config.container;
+    if (config.faststart) {
+      const outputArgs = Array.isArray(context.ffmpeg.outputArgs)
+        ? context.ffmpeg.outputArgs
+        : [];
+      context.ffmpeg.outputArgs = [...outputArgs, "-movflags", "+faststart"];
+    }
     log?.(`Container set: ${context.ffmpeg.container ?? "(unchanged)"}`);
     return { nextHandle: "out" };
   },

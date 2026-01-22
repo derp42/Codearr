@@ -5,6 +5,7 @@ export const def = createElementDef({
   label: "Execute FFmpeg",
   description: "Runs the FFmpeg command.",
   usage: "Connect success/fail outputs to downstream steps.",
+  weight: 8,
   fields: [
     {
       key: "injectStats",
@@ -12,6 +13,20 @@ export const def = createElementDef({
       type: "checkbox",
       default: true,
       description: "Adds -stats to the FFmpeg command for progress updates.",
+    },
+    {
+      key: "injectHwOutputFormat",
+      label: "Inject hwaccel output format",
+      type: "checkbox",
+      default: true,
+      description: "Adds -hwaccel_output_format cuda when hwaccel=cuda and not otherwise set.",
+    },
+    {
+      key: "addContainerFormat",
+      label: "Inject output container format",
+      type: "checkbox",
+      default: true,
+      description: "Adds -f <container> when no output format is provided.",
     },
     {
       key: "forceAudioCopy",
@@ -36,13 +51,76 @@ export const def = createElementDef({
 
 export default {
   ...def,
-  async execute({ context, node, log, runFfmpeg, reportFileUpdate }) {
+  async execute({ context, node, log, runFfmpeg, reportFileUpdate, reportProgress }) {
     log?.("FFmpeg execute: start");
     const ffmpeg = context.ffmpeg ?? {};
     const config = node?.data?.config ?? {};
     const injectStats = config.injectStats !== undefined ? Boolean(config.injectStats) : true;
+    const injectHwOutputFormat =
+      config.injectHwOutputFormat !== undefined ? Boolean(config.injectHwOutputFormat) : true;
+    const addContainerFormat =
+      config.addContainerFormat !== undefined ? Boolean(config.addContainerFormat) : true;
     const forceAudioCopy = config.forceAudioCopy !== undefined ? Boolean(config.forceAudioCopy) : true;
     const forceSubtitleCopy = config.forceSubtitleCopy !== undefined ? Boolean(config.forceSubtitleCopy) : true;
+
+    const rawCodec = String(ffmpeg.video?.codec ?? "").toLowerCase();
+    if (ffmpeg.hwaccel === "cuda" && ["h264", "hevc", "av1"].includes(rawCodec)) {
+      const nvencCodec = `${rawCodec}_nvenc`;
+      if (ffmpeg.video?.codec !== nvencCodec) {
+        ffmpeg.video = { ...(ffmpeg.video ?? {}), codec: nvencCodec };
+        log?.(`FFmpeg: hwaccel=cuda auto codec -> ${nvencCodec}`);
+      }
+    }
+
+    try {
+      log?.(
+        `FFmpeg context: ${JSON.stringify(
+          {
+            inputPath: ffmpeg.inputPath ?? null,
+            outputPath: ffmpeg.outputPath ?? null,
+            outputTemplate: ffmpeg.outputTemplate ?? null,
+            container: ffmpeg.container ?? null,
+            hwaccel: ffmpeg.hwaccel ?? null,
+            video: ffmpeg.video ?? null,
+            audio: ffmpeg.audio ?? null,
+            subtitles: ffmpeg.subtitles ?? null,
+            filters: ffmpeg.filters ?? [],
+            inputArgs: ffmpeg.inputArgs ?? [],
+            outputArgs: ffmpeg.outputArgs ?? [],
+            extraArgs: ffmpeg.extraArgs ?? [],
+          },
+          null,
+          2
+        )}`
+      );
+    } catch {
+      log?.("FFmpeg context: [unavailable]");
+    }
+
+    try {
+      log?.(
+        `FFmpeg context: ${JSON.stringify(
+          {
+            inputPath: ffmpeg.inputPath ?? null,
+            outputPath: ffmpeg.outputPath ?? null,
+            outputTemplate: ffmpeg.outputTemplate ?? null,
+            container: ffmpeg.container ?? null,
+            hwaccel: ffmpeg.hwaccel ?? null,
+            video: ffmpeg.video ?? null,
+            audio: ffmpeg.audio ?? null,
+            subtitles: ffmpeg.subtitles ?? null,
+            filters: ffmpeg.filters ?? [],
+            inputArgs: ffmpeg.inputArgs ?? [],
+            outputArgs: ffmpeg.outputArgs ?? [],
+            extraArgs: ffmpeg.extraArgs ?? [],
+          },
+          null,
+          2
+        )}`
+      );
+    } catch {
+      log?.("FFmpeg context: [unavailable]");
+    }
 
     let outputArgs = Array.isArray(ffmpeg.outputArgs) ? [...ffmpeg.outputArgs] : [];
     let explicitOutput = null;
@@ -68,6 +146,35 @@ export default {
       ffmpeg.extraArgs = [...(Array.isArray(ffmpeg.extraArgs) ? ffmpeg.extraArgs : []), "-c:s", "copy"];
     }
 
+    if (ffmpeg.audio?.codec === "aac" && !ffmpeg.audio?.channels && !ffmpeg.audio?.channelLayout) {
+      const audioStream = context?.probe?.streams?.find(
+        (stream) => stream.codec_type === "audio"
+      );
+      if (audioStream?.channels) {
+        ffmpeg.audio = {
+          ...(ffmpeg.audio ?? {}),
+          channels: audioStream.channels,
+          channelLayout: audioStream.channel_layout ?? ffmpeg.audio?.channelLayout,
+        };
+        log?.(
+          `FFmpeg audio layout defaulted: channels=${audioStream.channels}` +
+            (audioStream.channel_layout ? ` layout=${audioStream.channel_layout}` : "")
+        );
+      }
+    }
+
+    if (
+      injectHwOutputFormat &&
+      ffmpeg.hwaccel === "cuda" &&
+      !hasArg([ffmpeg.inputArgs, ffmpeg.extraArgs], "-hwaccel_output_format")
+    ) {
+      ffmpeg.inputArgs = [
+        ...(Array.isArray(ffmpeg.inputArgs) ? ffmpeg.inputArgs : []),
+        "-hwaccel_output_format",
+        "cuda",
+      ];
+    }
+
     const allowOutput =
       ffmpeg.outputPath != null || (ffmpeg.outputTemplate != null && ffmpeg.outputTemplate !== "");
     const container =
@@ -79,9 +186,7 @@ export default {
     const outputPath = allowOutput
       ? ffmpeg.outputPath ?? explicitOutput ?? null
       : null;
-    const fs = await getFs();
-    const tempOutputPath = outputPath && fs ? `${outputPath}.codarr.tmp` : null;
-    if (tempOutputPath && container && !hasFormatArg(outputArgs)) {
+    if (addContainerFormat && container && !hasFormatArg(outputArgs)) {
       outputArgs = [...outputArgs, "-f", container];
     }
     ffmpeg.outputPath = outputPath;
@@ -92,43 +197,58 @@ export default {
       log?.("FFmpeg execute: no output path provided. Provide an output name element or outputArgs.");
     }
 
+    const durationSec = Number(context?.input?.durationSec);
+    const totalFrames = Number(context?.input?.frameCount);
+    const stepName = node?.data?.elementType ?? node?.elementType ?? def.type ?? "ffmpeg_execute";
+    let lastProgressAt = 0;
+    let lastPercent = null;
+    const progressIntervalMs = 1000;
+
+    const handleProgress = (progress) => {
+      if (!reportProgress || !progress) return;
+      const now = Date.now();
+      if (now - lastProgressAt < progressIntervalMs) return;
+
+      let percent = null;
+      if (Number.isFinite(totalFrames) && Number.isFinite(progress.frame)) {
+        percent = Math.max(0, Math.min(100, Math.round((progress.frame / totalFrames) * 100)));
+      } else if (Number.isFinite(durationSec) && Number.isFinite(progress.timeSec)) {
+        percent = Math.max(0, Math.min(100, Math.round((progress.timeSec / durationSec) * 100)));
+      }
+      if (percent != null) {
+        lastPercent = lastPercent == null ? percent : Math.max(lastPercent, percent);
+      }
+      const reportPercent = percent != null ? percent : lastPercent ?? 0;
+
+      const fps = Number.isFinite(progress.fps) ? progress.fps : null;
+      const message = fps != null
+        ? `${stepName} ${reportPercent}% ${Math.round(fps)} fps`
+        : `${stepName} ${reportPercent}%`;
+
+      lastProgressAt = now;
+      reportProgress(reportPercent, message);
+    };
+
     try {
       await runFfmpeg({
         inputPath,
-        outputPath: tempOutputPath ?? outputPath,
+        outputPath,
         data: {
           container,
           video: ffmpeg.video,
           audio: ffmpeg.audio,
+          subtitles: ffmpeg.subtitles,
+          filters: ffmpeg.filters,
           extraArgs: ffmpeg.extraArgs,
           hwaccel: ffmpeg.hwaccel,
           inputArgs: ffmpeg.inputArgs,
           outputArgs: outputArgs,
         },
         log,
+        onProgress: handleProgress,
       });
     } catch (error) {
-      if (tempOutputPath && fs.existsSync(tempOutputPath)) {
-        try {
-          fs.unlinkSync(tempOutputPath);
-        } catch {
-          // ignore cleanup errors
-        }
-      }
       throw error;
-    }
-
-    if (tempOutputPath && outputPath && fs) {
-      if (fs.existsSync(outputPath)) {
-        try {
-          fs.unlinkSync(outputPath);
-        } catch {
-          // ignore
-        }
-      }
-      if (fs.existsSync(tempOutputPath)) {
-        fs.renameSync(tempOutputPath, outputPath);
-      }
     }
 
     context.outputPath = outputPath;
@@ -179,6 +299,14 @@ function hasFormatArg(args) {
     if (value.startsWith("-f")) return true;
     return false;
   });
+}
+
+function hasArg(groups, target) {
+  const needle = String(target ?? "").toLowerCase();
+  return groups
+    .filter((group) => Array.isArray(group))
+    .flat()
+    .some((arg) => String(arg).toLowerCase() === needle);
 }
 
 async function getFs() {

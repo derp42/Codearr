@@ -4,6 +4,7 @@ import { fileURLToPath } from "url";
 import fs from "fs";
 import { initDb } from "./db.js";
 import { config } from "./config.js";
+import { initFileLogger } from "./logger.js";
 import { createLibrariesRouter } from "./routes/libraries.js";
 import { createNodesRouter } from "./routes/nodes.js";
 import { createJobsRouter } from "./routes/jobs.js";
@@ -24,6 +25,9 @@ const logVerbose = (...args) => {
 const bootStart = Date.now();
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const dataDir = path.join(__dirname, "..", "data");
+const logFile = process.env.CODARR_SERVER_LOG_FILE ?? path.join(dataDir, "logs", "server.log");
+
+initFileLogger(logFile);
 
 if (!fs.existsSync(dataDir)) {
   logInfo("[boot] creating data directory...");
@@ -82,7 +86,7 @@ app.listen(config.port, config.host, () => {
 });
 
 setInterval(() => {
-  pruneStaleJobs(db, config.jobStaleMs);
+  pruneStaleJobs(db, config.jobStaleMs, config.nodeStaleMs);
 }, Math.max(10000, Math.floor(config.jobStaleMs / 2)));
 
 bootLibraries().then(() => {

@@ -83,6 +83,8 @@ const envHealthcheckGpuSlots = readEnv(process.env.CODARR_HEALTHCHECK_GPU_SLOTS)
 const envTranscodeGpuTargets = readEnv(process.env.CODARR_TRANSCODE_GPU_TARGETS) ?? "";
 const envTranscodeGpuSlots = readEnv(process.env.CODARR_TRANSCODE_GPU_SLOTS) ?? "";
 const envNodeTags = readEnv(process.env.CODARR_NODE_TAGS) ?? "";
+const envTempDir = readEnv(process.env.CODARR_TEMP_DIR) ?? "";
+const envPathMaps = readEnv(process.env.CODARR_PATH_MAPS) ?? "";
 
 const isWindows = process.platform === "win32";
 
@@ -207,6 +209,8 @@ export const config = {
   nodeTags: envNodeTags
     ? envNodeTags.split(/[\,\s]+/).map((tag) => tag.trim()).filter(Boolean)
     : [],
+  tempDir: envTempDir || null,
+  pathMappings: parsePathMappings(envPathMaps),
   ffmpegPath,
   ffprobePath,
   handbrakeCliPath,
@@ -237,6 +241,41 @@ export const config = {
   transcodeGpuTargets: envTranscodeGpuTargets,
   transcodeGpuSlots: envTranscodeGpuSlots,
 };
+
+function parsePathMappings(raw) {
+  if (!raw) return [];
+  const trimmed = String(raw).trim();
+  if (!trimmed) return [];
+
+  if (trimmed.startsWith("[") || trimmed.startsWith("{")) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (Array.isArray(parsed)) {
+        return parsed
+          .map((item) => ({ from: String(item?.from ?? "").trim(), to: String(item?.to ?? "").trim() }))
+          .filter((item) => item.from && item.to);
+      }
+      if (parsed && typeof parsed === "object") {
+        return Object.entries(parsed)
+          .map(([from, to]) => ({ from: String(from).trim(), to: String(to).trim() }))
+          .filter((item) => item.from && item.to);
+      }
+    } catch {
+      // fall through to delimiter parsing
+    }
+  }
+
+  return trimmed
+    .split(/\r?\n|;+/)
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .map((entry) => {
+      const match = entry.match(/(.+?)(?:=>|->|=)(.+)/);
+      if (!match) return null;
+      return { from: match[1].trim(), to: match[2].trim() };
+    })
+    .filter((item) => item && item.from && item.to);
+}
 
 function commonToolPaths(commandNames) {
   const names = new Set(commandNames);

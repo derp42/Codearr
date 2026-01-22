@@ -5,6 +5,7 @@ export const def = createElementDef({
   label: "Complete Job",
   description: "Ends the job successfully when reached.",
   usage: "Use to explicitly mark a successful end of a branch.",
+  weight: 0.2,
   outputs: [],
 });
 

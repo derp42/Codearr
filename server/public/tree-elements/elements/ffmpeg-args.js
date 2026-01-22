@@ -5,6 +5,7 @@ export const def = createElementDef({
   label: "FFmpeg Arguments",
   description: "Adds input/output FFmpeg arguments to the command.",
   usage: "Input args are placed before -i. Output args are placed before the output file.",
+  weight: 0.5,
   fields: [
     {
       key: "inputArgs",

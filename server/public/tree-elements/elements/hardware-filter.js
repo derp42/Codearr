@@ -5,6 +5,7 @@ export const def = createElementDef({
   label: "Hardware Filter",
   description: "Routes the job based on available hardware accelerators.",
   usage: "Configure a list of allowed accelerators; if empty, all nodes match.",
+  weight: 0.2,
   fields: [
     {
       key: "allowed",

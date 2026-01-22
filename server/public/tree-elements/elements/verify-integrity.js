@@ -5,6 +5,7 @@ export const def = createElementDef({
   label: "Verify Integrity",
   description: "Validates the output file by probing container metadata.",
   usage: "Connect ok/fail outputs based on probe result.",
+  weight: 2,
   outputs: [
     { id: "ok", label: "ok" },
     { id: "fail", label: "fail" },

@@ -5,6 +5,7 @@ export const def = createElementDef({
   label: "Re-queue Job",
   description: "Re-enqueues the current job back to the transcode queue.",
   usage: "Debug-only: use to restart a transcode job from the beginning.",
+  weight: 0.2,
   outputs: [],
 });
 

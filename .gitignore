@@ -9,5 +9,8 @@ node/src/tree-elements/remote/
 # Runtime data
 server/data/
 
+# Node temp working directory
+node/tmp/
+
 # Local environment files
 **/.env

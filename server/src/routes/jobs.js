@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { nextJobs, completeJob, updateJobProgress, reenqueueByStatus, requeueJob } from "../services/queue.js";
 import { scanLibrary } from "../services/scanner.js";
+import { config } from "../config.js";
 
 export function createJobsRouter(db) {
   const router = Router();
@@ -156,6 +157,14 @@ export function createJobsRouter(db) {
         console.error(`Failed to rescan library ${library.name}:`, err.message ?? err);
       });
     });
+    res.json({ ok: true });
+  });
+
+  router.post("/:id/clear-log", (req, res) => {
+    if (!config.debugMode) return res.status(403).json({ error: "debug only" });
+    const { id } = req.params;
+    const result = db.prepare("UPDATE jobs SET log_text = '' WHERE id = ?").run(id);
+    if (!result.changes) return res.status(404).json({ error: "job not found" });
     res.json({ ok: true });
   });
 

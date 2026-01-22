@@ -5,6 +5,7 @@ export const def = createElementDef({
   label: "FFmpeg Output Name",
   description: "Builds the output filename from a template.",
   usage: "Use before Execute FFmpeg to generate the output filename.",
+  weight: 0.5,
   fields: [
     {
       key: "outputTemplate",
@@ -36,6 +37,7 @@ export default {
     }
 
     const inputPath = context.ffmpeg.inputPath ?? context.input?.path ?? context.filePath;
+    const outputBaseDir = context.jobTempDir ?? getDirname(inputPath || "");
     const container =
       context.ffmpeg.container ??
       context.input?.container ??
@@ -44,6 +46,7 @@ export default {
 
     const outputPath = buildOutputFromTemplate(template, {
       inputPath,
+      outputDir: outputBaseDir,
       container,
       videoCodec: context.ffmpeg.video?.codec,
       audioCodec: context.ffmpeg.audio?.codec,
@@ -53,7 +56,9 @@ export default {
     context.ffmpeg.outputPath = outputPath;
 
     if (outputPath) {
-      reportFileUpdate?.({ new_path: outputPath }, "ffmpeg", "Output path registered");
+      if (!context.jobTempDir || !outputPath.startsWith(context.jobTempDir)) {
+        reportFileUpdate?.({ new_path: outputPath }, "ffmpeg", "Output path registered");
+      }
       log?.(`FFmpeg output name: ${outputPath}`);
     } else {
       log?.("FFmpeg output name: no output path resolved.");
@@ -63,9 +68,12 @@ export default {
   },
 };
 
-function buildOutputFromTemplate(template, { inputPath, container, videoCodec, audioCodec, hwaccel }) {
+function buildOutputFromTemplate(
+  template,
+  { inputPath, outputDir, container, videoCodec, audioCodec, hwaccel }
+) {
   if (!template) return null;
-  const dir = inputPath ? getDirname(inputPath) : "";
+  const dir = outputDir ?? (inputPath ? getDirname(inputPath) : "");
   const base = inputPath ? getBasename(inputPath, getExtname(inputPath)) : "output";
   const ext = container || getExtname(inputPath || "").replace(".", "") || "mkv";
 
