@@ -229,26 +229,50 @@ export default {
       reportProgress(reportPercent, message);
     };
 
-    try {
-      await runFfmpeg({
-        inputPath,
-        outputPath,
-        data: {
-          container,
-          video: ffmpeg.video,
-          audio: ffmpeg.audio,
-          subtitles: ffmpeg.subtitles,
-          filters: ffmpeg.filters,
-          extraArgs: ffmpeg.extraArgs,
-          hwaccel: ffmpeg.hwaccel,
-          inputArgs: ffmpeg.inputArgs,
-          outputArgs: outputArgs,
-        },
-        log,
-        onProgress: handleProgress,
-      });
-    } catch (error) {
-      throw error;
+    const baseData = {
+      container,
+      video: ffmpeg.video,
+      audio: ffmpeg.audio,
+      subtitles: ffmpeg.subtitles,
+      filters: ffmpeg.filters,
+      extraArgs: ffmpeg.extraArgs,
+      hwaccel: ffmpeg.hwaccel,
+      inputArgs: ffmpeg.inputArgs,
+      outputArgs: outputArgs,
+    };
+
+    const retryPolicy = context.ffmpeg?.retryPolicy ?? null;
+    const retrySteps = retryPolicy?.enabled ? ensureArray(retryPolicy.steps) : [];
+    const attempts = [
+      { name: "primary", data: baseData },
+      ...retrySteps.map((step, index) => ({
+        name: step?.name ?? `retry_${index + 1}`,
+        data: applyRetryStep(baseData, step),
+      })),
+    ];
+
+    let lastError = null;
+    for (let i = 0; i < attempts.length; i += 1) {
+      const attempt = attempts[i];
+      if (i > 0) log?.(`FFmpeg retry: attempt ${i + 1}/${attempts.length} (${attempt.name})`);
+      try {
+        await runFfmpeg({
+          inputPath,
+          outputPath,
+          data: attempt.data,
+          log,
+          onProgress: handleProgress,
+        });
+        lastError = null;
+        break;
+      } catch (error) {
+        lastError = error;
+        log?.(`FFmpeg attempt failed: ${error?.message ?? error}`);
+      }
+    }
+
+    if (lastError) {
+      throw lastError;
     }
 
     context.outputPath = outputPath;
@@ -265,6 +289,34 @@ function getExtname(filePath) {
   const lastDot = value.lastIndexOf(".");
   if (lastDot === -1 || lastDot <= lastSlash) return "";
   return value.slice(lastDot);
+}
+
+function applyRetryStep(baseData, step) {
+  const data = JSON.parse(JSON.stringify(baseData ?? {}));
+  if (!step) return data;
+  if (step.disableHwaccel) {
+    delete data.hwaccel;
+  }
+  if (step.forceVideoCodec) {
+    data.video = { ...(data.video ?? {}), codec: step.forceVideoCodec };
+  }
+  if (step.dropVideoBitrate) {
+    if (data.video) {
+      delete data.video.bitrateKbps;
+      delete data.video.maxrateKbps;
+      delete data.video.bufsizeKbps;
+    }
+  }
+  if (step.resetFilters) {
+    data.filters = [];
+  }
+  if (step.disableSubtitles) {
+    data.subtitles = { disabled: true };
+  }
+  if (step.stripOutputArgs) {
+    data.outputArgs = [];
+  }
+  return data;
 }
 
 function hasStatsArg(groups) {

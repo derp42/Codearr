@@ -48,11 +48,36 @@ function markJobFailed(db, job, reason) {
   appendJobLog(db, job.id, "system", reason ?? "Job marked failed (orphaned)");
 }
 
+export function markJobsForDeletedFile(db, fileId, reason = "File deleted") {
+  if (!fileId) return;
+  const now = new Date().toISOString();
+  const jobs = db.prepare("SELECT id, type FROM jobs WHERE file_id = ?").all(fileId);
+
+  const hasTranscode = jobs.some((job) => job.type === JOB_TYPES.transcode);
+  const fileStatus = hasTranscode ? FILE_STATUS.transcodeFailed : FILE_STATUS.healthFailed;
+
+  db.prepare("UPDATE files SET status = ?, deleted_at = ?, updated_at = ? WHERE id = ?").run(
+    fileStatus,
+    now,
+    now,
+    fileId
+  );
+
+  jobs.forEach((job) => {
+    db.prepare(
+      "UPDATE jobs SET status = ?, deleted_at = ?, assigned_node_id = NULL, progress = 0, progress_message = NULL, updated_at = ? WHERE id = ?"
+    ).run(JOB_STATUS.error, now, now, job.id);
+    appendJobLog(db, job.id, "system", reason);
+  });
+}
+
 export function enqueueFile(db, fileId) {
   return enqueueHealthcheck(db, fileId);
 }
 
 export function enqueueHealthcheck(db, fileId) {
+  const fileRow = db.prepare("SELECT deleted_at FROM files WHERE id = ?").get(fileId);
+  if (fileRow?.deleted_at) return null;
   const existing = db
     .prepare("SELECT id FROM jobs WHERE file_id = ? ORDER BY updated_at DESC LIMIT 1")
     .get(fileId);
@@ -116,7 +141,7 @@ function nextJobsLegacy(db, nodeId, slots = { cpu: 1, gpu: 0 }, accelerators = [
        FROM jobs j
        JOIN files f ON f.id = j.file_id
        JOIN libraries l ON l.id = f.library_id
-       WHERE j.status = ?
+       WHERE j.status = ? AND j.deleted_at IS NULL AND f.deleted_at IS NULL
        ORDER BY j.created_at ASC`
     )
      .all(JOB_STATUS.queued);
@@ -269,7 +294,7 @@ function nextJobsTyped(db, nodeId, slots, accelerators = [], { allowTranscode = 
        FROM jobs j
        JOIN files f ON f.id = j.file_id
        JOIN libraries l ON l.id = f.library_id
-       WHERE j.status = ?
+       WHERE j.status = ? AND j.deleted_at IS NULL AND f.deleted_at IS NULL
        ORDER BY j.created_at ASC`
     )
      .all(JOB_STATUS.queued);
@@ -815,6 +840,12 @@ export function requeueJob(db, jobId, targetType = "transcode") {
   const job = db.prepare("SELECT * FROM jobs WHERE id = ?").get(jobId);
   if (!job) return false;
 
+  const fileRow = db.prepare("SELECT deleted_at FROM files WHERE id = ?").get(job.file_id);
+  if (fileRow?.deleted_at) {
+    markJobsForDeletedFile(db, job.file_id, "File deleted; requeue blocked");
+    return false;
+  }
+
   const now = new Date().toISOString();
   const nextType = targetType === "healthcheck" ? JOB_TYPES.healthcheck : JOB_TYPES.transcode;
   const nextStatus = nextType === JOB_TYPES.transcode ? FILE_STATUS.transcode : FILE_STATUS.healthcheck;
@@ -833,8 +864,8 @@ export function requeueJob(db, jobId, targetType = "transcode") {
 export function reenqueueByStatus(db, status, type) {
   const statusList = normalizeStatusList(status);
   const placeholders = statusList.map(() => "?").join(", ");
-  const baseSql = `SELECT id, file_id FROM jobs WHERE status IN (${placeholders})`;
-  const sql = type ? `${baseSql} AND type = ?` : baseSql;
+  const baseSql = `SELECT j.id, j.file_id FROM jobs j JOIN files f ON f.id = j.file_id WHERE j.status IN (${placeholders}) AND j.deleted_at IS NULL AND f.deleted_at IS NULL`;
+  const sql = type ? `${baseSql} AND j.type = ?` : baseSql;
   const params = type ? [...statusList, type] : statusList;
   const jobs = db.prepare(sql).all(...params);
   const now = new Date().toISOString();

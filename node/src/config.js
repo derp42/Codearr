@@ -85,6 +85,10 @@ const envTranscodeGpuSlots = readEnv(process.env.CODARR_TRANSCODE_GPU_SLOTS) ?? 
 const envNodeTags = readEnv(process.env.CODARR_NODE_TAGS) ?? "";
 const envTempDir = readEnv(process.env.CODARR_TEMP_DIR) ?? "";
 const envPathMaps = readEnv(process.env.CODARR_PATH_MAPS) ?? "";
+const envApiSignatureSkewSec = readEnv(process.env.CODARR_API_SIGNATURE_SKEW_SEC) ?? "300";
+const envNodePrivateKey = readEnv(process.env.CODARR_NODE_PRIVATE_KEY) ?? "";
+const envNodePublicKey = readEnv(process.env.CODARR_NODE_PUBLIC_KEY) ?? "";
+const envServerPublicKey = readEnv(process.env.CODARR_SERVER_PUBLIC_KEY) ?? "";
 
 const isWindows = process.platform === "win32";
 
@@ -202,6 +206,19 @@ if (amdSmiPath) {
   console.warn("amd-smi not found. Set CODARR_AMD_SMI_PATH to override.");
 }
 
+function loadKey(raw) {
+  const value = String(raw ?? "").trim();
+  if (!value) return "";
+  if (value.startsWith("base64:")) {
+    const data = value.slice("base64:".length);
+    return Buffer.from(data, "base64").toString("utf8");
+  }
+  if (fs.existsSync(value)) {
+    return fs.readFileSync(value, "utf8");
+  }
+  return value;
+}
+
 export const config = {
   serverUrl,
   nodeName,
@@ -211,6 +228,10 @@ export const config = {
     : [],
   tempDir: envTempDir || null,
   pathMappings: parsePathMappings(envPathMaps),
+  nodePrivateKey: loadKey(envNodePrivateKey),
+  nodePublicKey: loadKey(envNodePublicKey),
+  serverPublicKey: loadKey(envServerPublicKey),
+  apiSignatureSkewSec: Number(envApiSignatureSkewSec ?? 300),
   ffmpegPath,
   ffprobePath,
   handbrakeCliPath,

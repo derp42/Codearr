@@ -43,7 +43,7 @@ function parseBoolean(value, fallback) {
 
 export default {
   ...def,
-  async execute({ context, node, log, reportFileUpdate }) {
+  async execute({ context, node, log, reportFileUpdate, ffprobeFile, buildPathMetrics }) {
     log?.("Move output file: start");
     const fs = await import("node:fs");
     const path = await import("node:path");
@@ -78,13 +78,49 @@ export default {
       log?.("Original deleted");
     }
 
+    if (fs.existsSync(outputPath) && typeof ffprobeFile === "function") {
+      try {
+        const stats = fs.statSync(outputPath);
+        const probe = await ffprobeFile(outputPath);
+        const metrics = buildPathMetrics ? buildPathMetrics(stats, probe) : null;
+        reportFileUpdate?.(
+          { new_path: targetPath },
+          "move_output_file",
+          "Output will move",
+          null,
+          metrics ? [{ path: targetPath, metrics }] : undefined
+        );
+      } catch {
+        reportFileUpdate?.({ new_path: targetPath }, "move_output_file", "Output will move");
+      }
+    } else {
+      reportFileUpdate?.({ new_path: targetPath }, "move_output_file", "Output will move");
+    }
+
     if (outputPath !== targetPath) {
       fs.renameSync(outputPath, targetPath);
     }
 
     context.finalPath = targetPath;
     context.outputPath = targetPath;
-    reportFileUpdate?.({ new_path: targetPath }, "move_output_file", "Output moved");
+    if (fs.existsSync(targetPath) && typeof ffprobeFile === "function") {
+      try {
+        const stats = fs.statSync(targetPath);
+        const probe = await ffprobeFile(targetPath);
+        const metrics = buildPathMetrics ? buildPathMetrics(stats, probe) : null;
+        reportFileUpdate?.(
+          { new_path: targetPath },
+          "move_output_file",
+          "Output moved",
+          null,
+          metrics ? [{ path: targetPath, metrics }] : undefined
+        );
+      } catch {
+        reportFileUpdate?.({ new_path: targetPath }, "move_output_file", "Output moved");
+      }
+    } else {
+      reportFileUpdate?.({ new_path: targetPath }, "move_output_file", "Output moved");
+    }
     log?.(`Output moved to ${targetPath}`);
     return { nextHandle: "out" };
   },

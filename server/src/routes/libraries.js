@@ -1,17 +1,28 @@
 import { Router } from "express";
+import path from "path";
 import { nanoid } from "nanoid";
 import { pruneMissingLibraryFiles, scanLibrary, startLibraryScan } from "../services/scanner.js";
 import { watchLibrary } from "../services/watcher.js";
 import { pruneOrphanJobs } from "../services/queue.js";
+import { config } from "../config.js";
+
+function normalizePathForCompare(filePath) {
+  if (!filePath) return "";
+  const normalized = path.normalize(filePath);
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+}
 
 export function createLibrariesRouter(db, watchers, scanTimers) {
   const router = Router();
 
   router.get("/", (req, res) => {
+    const includeDeleted = String(req.query.includeDeleted ?? "").toLowerCase() === "true";
     const libraries = db
       .prepare(
         `SELECT l.*, 
-          (SELECT COUNT(*) FROM files f WHERE f.library_id = l.id) AS file_count
+          (SELECT COUNT(*) FROM files f WHERE f.library_id = l.id ${
+            includeDeleted ? "" : "AND f.deleted_at IS NULL"
+          }) AS file_count
          FROM libraries l
          ORDER BY l.created_at DESC`
       )
@@ -23,17 +34,75 @@ export function createLibrariesRouter(db, watchers, scanTimers) {
     const { id } = req.params;
     const limit = Math.min(Number(req.query.limit ?? 25), 200);
     const offset = Number(req.query.offset ?? 0);
+    const includeDeleted = String(req.query.includeDeleted ?? "").toLowerCase() === "true";
+    const deletedClause = includeDeleted ? "" : "AND deleted_at IS NULL";
 
     const totalRow = db
-      .prepare("SELECT COUNT(*) AS count FROM files WHERE library_id = ?")
+      .prepare(`SELECT COUNT(*) AS count FROM files WHERE library_id = ? ${deletedClause}`)
       .get(id);
     const files = db
       .prepare(
-        "SELECT * FROM files WHERE library_id = ? ORDER BY updated_at DESC LIMIT ? OFFSET ?"
+        `SELECT * FROM files WHERE library_id = ? ${deletedClause} ORDER BY updated_at DESC LIMIT ? OFFSET ?`
       )
       .all(id, limit, offset);
 
-    res.json({ total: totalRow?.count ?? 0, files });
+    const pathStmt = db.prepare(
+      `SELECT path, created_at, updated_at, deleted_at,
+        size, container, video_codec, video_profile,
+        width, height, frame_rate, video_bitrate, audio_bitrate, overall_bitrate,
+        duration_sec, frame_count,
+        audio_tracks, subtitle_tracks,
+        audio_codecs, subtitle_codecs, audio_languages, subtitle_languages,
+        audio_tracks_json, subtitle_tracks_json
+       FROM file_paths
+       WHERE file_id = ? ${includeDeleted ? "" : "AND deleted_at IS NULL"}
+       ORDER BY updated_at DESC, created_at DESC, path`
+    );
+    const enriched = files.map((file) => ({
+      ...file,
+      paths: (() => {
+        const rows = pathStmt
+          .all(file.id)
+          .map((row) => ({
+            path: row.path,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+            deleted_at: row.deleted_at,
+            size: row.size,
+            container: row.container,
+            video_codec: row.video_codec,
+            video_profile: row.video_profile,
+            width: row.width,
+            height: row.height,
+            frame_rate: row.frame_rate,
+            video_bitrate: row.video_bitrate,
+            audio_bitrate: row.audio_bitrate,
+            overall_bitrate: row.overall_bitrate,
+            duration_sec: row.duration_sec,
+            frame_count: row.frame_count,
+            audio_tracks: row.audio_tracks,
+            subtitle_tracks: row.subtitle_tracks,
+            audio_codecs: row.audio_codecs,
+            subtitle_codecs: row.subtitle_codecs,
+            audio_languages: row.audio_languages,
+            subtitle_languages: row.subtitle_languages,
+            audio_tracks_json: row.audio_tracks_json,
+            subtitle_tracks_json: row.subtitle_tracks_json,
+          }))
+          .filter((row) => row.path);
+        const seen = new Set();
+        const unique = [];
+        for (const row of rows) {
+          const key = normalizePathForCompare(row.path);
+          if (!key || seen.has(key)) continue;
+          seen.add(key);
+          unique.push(row);
+        }
+        return unique;
+      })(),
+    }));
+
+    res.json({ total: totalRow?.count ?? 0, files: enriched });
   });
 
   router.get("/:id/tree", (req, res) => {
@@ -174,6 +243,7 @@ export function createLibrariesRouter(db, watchers, scanTimers) {
     }
 
     db.prepare("DELETE FROM jobs WHERE file_id IN (SELECT id FROM files WHERE library_id = ?)").run(id);
+    db.prepare("DELETE FROM file_paths WHERE file_id IN (SELECT id FROM files WHERE library_id = ?)").run(id);
     db.prepare("DELETE FROM files WHERE library_id = ?").run(id);
     db.prepare("DELETE FROM library_tree_map WHERE library_id = ?").run(id);
     db.prepare("DELETE FROM library_tree_rules WHERE library_id = ?").run(id);
@@ -189,6 +259,49 @@ export function createLibrariesRouter(db, watchers, scanTimers) {
     if (!library) return res.status(404).json({ error: "library not found" });
     await pruneMissingLibraryFiles(db, library);
     await scanLibrary(db, library);
+    res.json({ ok: true });
+  });
+
+  router.post("/:id/reset", async (req, res) => {
+    if (!config.debugMode) return res.status(403).json({ error: "debug only" });
+    const { id } = req.params;
+    const library = db.prepare("SELECT * FROM libraries WHERE id = ?").get(id);
+    if (!library) return res.status(404).json({ error: "library not found" });
+
+    db.prepare("DELETE FROM jobs WHERE file_id IN (SELECT id FROM files WHERE library_id = ?)")
+      .run(id);
+    db.prepare("DELETE FROM file_paths WHERE file_id IN (SELECT id FROM files WHERE library_id = ?)")
+      .run(id);
+    db.prepare("DELETE FROM files WHERE library_id = ?").run(id);
+
+    await scanLibrary(db, library);
+    res.json({ ok: true });
+  });
+
+  router.delete("/:id/files/:fileId", (req, res) => {
+    if (!config.debugMode) return res.status(403).json({ error: "debug only" });
+    const { id, fileId } = req.params;
+    const file = db.prepare("SELECT id FROM files WHERE id = ? AND library_id = ?").get(fileId, id);
+    if (!file) return res.status(404).json({ error: "file not found" });
+
+    db.prepare("DELETE FROM jobs WHERE file_id = ?").run(fileId);
+    db.prepare("DELETE FROM file_paths WHERE file_id = ?").run(fileId);
+    db.prepare("DELETE FROM files WHERE id = ?").run(fileId);
+    pruneOrphanJobs(db);
+
+    res.json({ ok: true });
+  });
+
+  router.delete("/:id/files/:fileId/paths", (req, res) => {
+    if (!config.debugMode) return res.status(403).json({ error: "debug only" });
+    const { id, fileId } = req.params;
+    const pathValue = String(req.query.path ?? "").trim();
+    if (!pathValue) return res.status(400).json({ error: "path required" });
+
+    const file = db.prepare("SELECT id FROM files WHERE id = ? AND library_id = ?").get(fileId, id);
+    if (!file) return res.status(404).json({ error: "file not found" });
+
+    db.prepare("DELETE FROM file_paths WHERE file_id = ? AND path = ?").run(fileId, pathValue);
     res.json({ ok: true });
   });
 

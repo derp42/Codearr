@@ -19,7 +19,10 @@ let isLogModalOpen = false;
 let isTreeModalOpen = false;
 let isTreeAssignModalOpen = false;
 let isNodeSettingsModalOpen = false;
+let isServerKeysModalOpen = false;
 let nodeSettingsState = { nodeId: null, name: "", values: {} };
+let serverKeysState = { publicKey: "" };
+let showDeletedJobs = false;
 let isTreeDesignerActive = false;
 let treeDesignerRoot = null;
 let treeDesignerState = { treeId: null };
@@ -38,6 +41,7 @@ const collapsedJobSections = new Set();
 const jobSectionPage = new Map();
 const jobSectionPageSize = new Map();
 const expandedNav = new Set();
+const viewScrollCache = new Map();
 const libraryFormState = {
   name: "",
   path: "",
@@ -63,6 +67,9 @@ const routes = {
   jobs: renderJobs,
   trees: renderTrees,
 };
+
+ensureServerSettingsModal();
+bindServerSettingsButton();
 
 
 navItems.forEach((item) => {
@@ -221,6 +228,13 @@ async function renderDashboard() {
         </div>
         <p class="muted">Health: ${formatCount(counts.healthcheckError)} • Transcode: ${formatCount(counts.transcodeError)}</p>
       </button>
+      <button class="card card-link" data-server-keys>
+        <div class="card-meta">
+          <h3>Server Keys</h3>
+          <span class="muted">Manage signing keys</span>
+        </div>
+        <p class="muted">Generate or rotate server keys</p>
+      </button>
     </div>
   `;
 
@@ -239,9 +253,16 @@ function bindDashboardCards() {
       if (viewName) setActiveView(viewName);
     });
   });
+
+  const serverKeysButton = view.querySelector("[data-server-keys]");
+  serverKeysButton?.addEventListener("click", async () => {
+    await openServerKeysModal();
+  });
 }
 
 async function renderLibraries() {
+  const cachedScroll = viewScrollCache.get("libraries");
+  const scrollTop = cachedScroll ?? view.scrollTop;
   const existingName = document.querySelector("#library-form input[name='name']")?.value;
   const existingPath = document.querySelector("#library-form input[name='path']")?.value;
   const existingInclude = document.querySelector(
@@ -259,8 +280,9 @@ async function renderLibraries() {
   if (existingNodes !== undefined) libraryFormState.nodes = existingNodes;
   if (existingScan !== undefined) libraryFormState.scanIntervalMin = existingScan;
 
+  const showDeleted = libraryFormState.showDeleted === true;
   const [libs, nodes, trees] = await Promise.all([
-    fetchJson("/api/libraries"),
+    fetchJson(`/api/libraries${showDeleted ? "?includeDeleted=true" : ""}`),
     fetchJson("/api/nodes"),
     fetchJson("/api/trees"),
   ]);
@@ -268,13 +290,19 @@ async function renderLibraries() {
   const nodeNames = nodes.map((node) => node.name).sort();
 
   view.innerHTML = `
-    <div class="card tree-designer-card">
+    <div class="card tree-designer-card library-designer-card">
       <div class="card-header">
         <div>
           <h3>Libraries</h3>
           <p class="muted">Manage library entries and scan settings.</p>
         </div>
-        <button class="primary" id="add-library">Add Library</button>
+        <div class="actions">
+          <label class="toggle">
+            <input type="checkbox" id="toggle-deleted-libraries" ${showDeleted ? "checked" : ""} />
+            <span>Show deleted</span>
+          </label>
+          <button class="primary" id="add-library">Add Library</button>
+        </div>
       </div>
     </div>
     <div class="card" style="margin-top:16px;">
@@ -295,10 +323,25 @@ async function renderLibraries() {
                     <td>${lib.file_count ?? 0}</td>
                     <td>${new Date(lib.created_at).toLocaleString()}</td>
                     <td>
-                      <button class="ghost" data-library-toggle="${lib.id}">Files</button>
-                      <button class="ghost" data-library-rescan="${lib.id}">Rescan</button>
-                      <button class="ghost" data-library-edit="${lib.id}">Edit</button>
-                      <button class="ghost danger" data-library-delete="${lib.id}">Delete</button>
+                      <div class="library-actions">
+                        <button class="icon-button" data-library-toggle="${lib.id}" aria-label="Files" title="Files">
+                          📁
+                          <span class="icon-label">Files</span>
+                        </button>
+                        <button class="icon-button" data-library-rescan="${lib.id}" aria-label="Rescan" title="Rescan">
+                          ↻
+                          <span class="icon-label">Rescan</span>
+                        </button>
+                        <button class="icon-button" data-library-edit="${lib.id}" aria-label="Edit" title="Edit">
+                          ✎
+                          <span class="icon-label">Edit</span>
+                        </button>
+                        ${appConfig?.debug ? `<button class="icon-button danger" data-library-reset="${lib.id}" aria-label="Reset" title="Reset">⟲<span class="icon-label">Reset</span></button>` : ""}
+                        <button class="icon-button danger" data-library-delete="${lib.id}" aria-label="Delete" title="Delete">
+                          🗑
+                          <span class="icon-label">Delete</span>
+                        </button>
+                      </div>
                     </td>
                   </tr>
                   ${detailsRow}
@@ -310,6 +353,17 @@ async function renderLibraries() {
     </div>
     ${renderLibraryModal(nodeNames, cachedTrees)}
   `;
+
+  view.scrollTop = scrollTop;
+  requestAnimationFrame(() => {
+    view.scrollTop = scrollTop;
+  });
+
+  const toggleDeleted = document.getElementById("toggle-deleted-libraries");
+  toggleDeleted?.addEventListener("change", async () => {
+    libraryFormState.showDeleted = toggleDeleted.checked;
+    await renderLibraries();
+  });
 
   const addBtn = document.getElementById("add-library");
   addBtn.addEventListener("click", () => openLibraryModal());
@@ -342,6 +396,19 @@ async function renderLibraries() {
       const libId = btn.dataset.libraryRescan;
       if (!libId) return;
       await fetch(`/api/libraries/${libId}/rescan`, { method: "POST" });
+      await renderLibraries();
+    });
+  });
+
+  const resetButtons = view.querySelectorAll("button[data-library-reset]");
+  resetButtons.forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const libId = btn.dataset.libraryReset;
+      const lib = libs.find((item) => item.id === libId);
+      const name = lib?.name ?? "this library";
+      if (!confirm(`Reset ${name}? This hard-deletes all entries and jobs, then rescans.`)) return;
+      await fetch(`/api/libraries/${libId}/reset`, { method: "POST" });
+      expandedLibraries.add(libId);
       await renderLibraries();
     });
   });
@@ -408,7 +475,8 @@ async function renderNodes() {
                 isExpanded,
                 node.last_seen,
                 ramDetailText,
-                node.hardware?.ffmpegWarnings ?? []
+                node.hardware?.ffmpegWarnings ?? [],
+                node.jobs ?? []
               );
 
               return `<tr>
@@ -419,12 +487,14 @@ async function renderNodes() {
                 <td class="usage-cell">${renderUsageMeter(ramPercent, ramText, true)}</td>
                 <td class="usage-cell">${renderUsageMeter(gpuUtil, gpuSummary)}</td>
                 <td>
-                  ${
-                    node.stale
-                      ? `<button class="danger" data-node-id="${node.id}">Delete</button>`
-                      : `<button class="ghost" data-gpu-toggle="${node.id}">Details</button>`
-                  }
-                  <button class="ghost" data-node-limits="${node.id}">Limits</button>
+                  <div class="node-actions">
+                    ${
+                      node.stale
+                        ? `<button class="icon-button danger" data-node-id="${node.id}" aria-label="Delete" title="Delete">🗑<span class="icon-label">Delete</span></button>`
+                        : `<button class="icon-button" data-gpu-toggle="${node.id}" aria-label="Details" title="Details">📊<span class="icon-label">Details</span></button>`
+                    }
+                    <button class="icon-button" data-node-limits="${node.id}" aria-label="Settings" title="Settings">⚙<span class="icon-label">Settings</span></button>
+                  </div>
                 </td>
               </tr>${detailsRow}`;
             })
@@ -477,7 +547,7 @@ async function renderNodes() {
 
 async function renderJobs() {
   const [jobs, config] = await Promise.all([
-    fetchJson("/api/jobs/queue?limit=1000"),
+    fetchJson(`/api/jobs/queue?limit=1000${showDeletedJobs ? "&includeDeleted=true" : ""}`),
     fetchJson("/api/config"),
   ]);
 
@@ -518,8 +588,16 @@ async function renderJobs() {
           <p class="muted">Re-enqueue failed or unhealthy jobs.</p>
         </div>
         <div class="actions">
-          <button class="ghost" id="reenqueue-health-failed">Re-enqueue health failed</button>
-          <button class="ghost" id="reenqueue-transcode-failed">Re-enqueue failed transcodes</button>
+          <label class="toggle">
+            <input type="checkbox" id="toggle-deleted-jobs" ${showDeletedJobs ? "checked" : ""} />
+            <span>Show deleted</span>
+          </label>
+          <button class="icon-button" id="reenqueue-health-failed" aria-label="Re-enqueue health failed" title="Re-enqueue health failed">
+            ↻
+          </button>
+          <button class="icon-button" id="reenqueue-transcode-failed" aria-label="Re-enqueue failed transcodes" title="Re-enqueue failed transcodes">
+            ↻
+          </button>
           ${
             config.debug
               ? `<button class="danger" id="reset-jobs">Reset jobs</button>`
@@ -540,8 +618,8 @@ async function renderJobs() {
             <div class="card" style="margin-top:16px;">
               <div class="card-header">
                 <h4>${section.title} <span class="muted">(${rows.length})</span></h4>
-                <button class="ghost" data-job-section-toggle="${section.key}">
-                  ${isCollapsed ? "Expand" : "Collapse"}
+                <button class="icon-button" data-job-section-toggle="${section.key}" aria-label="${isCollapsed ? "Expand" : "Collapse"}" title="${isCollapsed ? "Expand" : "Collapse"}">
+                  ${isCollapsed ? "+" : "−"}
                 </button>
               </div>
               <div class="jobs-section-controls ${isCollapsed ? "hidden" : ""}">
@@ -559,11 +637,11 @@ async function renderJobs() {
                 <div class="pager">
                   <button class="ghost" data-job-page-prev="${section.key}" ${
                     page === 0 || pageSize === Infinity ? "disabled" : ""
-                  }>Prev</button>
+                  } aria-label="Previous page" title="Previous page">⏮</button>
                   <span class="muted">Page ${page + 1} / ${totalPages}</span>
                   <button class="ghost" data-job-page-next="${section.key}" ${
                     page + 1 >= totalPages || pageSize === Infinity ? "disabled" : ""
-                  }>Next</button>
+                  } aria-label="Next page" title="Next page">⏭</button>
                 </div>
               </div>
               <table class="table ${isCollapsed ? "hidden" : ""}">
@@ -595,7 +673,7 @@ async function renderJobs() {
                             <div class="job-actions">
                               ${
                                 canReenqueue
-                                  ? `<button class="ghost" data-reenqueue-status="${normalizedStatus}" data-reenqueue-type="${job.type}">Re-enqueue</button>`
+                                  ? `<button class="icon-button" data-reenqueue-status="${normalizedStatus}" data-reenqueue-type="${job.type}" aria-label="Re-enqueue" title="Re-enqueue">↻</button>`
                                   : ""
                               }
                               ${
@@ -603,9 +681,7 @@ async function renderJobs() {
                                   ? `
                                     <div class="job-action-wrap">
                                       <button class="icon-button" data-job-actions="${job.id}" aria-label="Actions" title="Actions">
-                                        <svg viewBox="0 0 24 24" aria-hidden="true">
-                                          <path d="M19.4 13.5c.04-.5.04-1 .02-1.5l2-1.6c.18-.14.23-.4.12-.6l-1.9-3.3c-.11-.2-.36-.28-.57-.2l-2.3.9c-.4-.3-.9-.6-1.4-.8l-.3-2.4a.48.48 0 0 0-.48-.42h-3.8c-.24 0-.45.18-.48.42l-.3 2.4c-.5.2-1 .5-1.4.8l-2.3-.9c-.21-.08-.46 0-.57.2L2.7 9.8c-.11.2-.06.46.12.6l2 1.6c-.02.5-.02 1 .02 1.5l-2 1.6c-.18.14-.23.4-.12.6l1.9 3.3c.11.2.36.28.57.2l2.3-.9c.4.3.9.6 1.4.8l.3 2.4c.03.24.24.42.48.42h3.8c.24 0 .45-.18.48-.42l.3-2.4c.5-.2 1-.5 1.4-.8l2.3.9c.21.08.46 0 .57-.2l1.9-3.3c.11-.2.06-.46-.12-.6l-2-1.6ZM12 15.6a3.6 3.6 0 1 1 0-7.2 3.6 3.6 0 0 1 0 7.2Z"/>
-                                        </svg>
+                                        ⚙
                                         <span class="icon-label">Actions</span>
                                       </button>
                                       <div class="job-action-menu hidden" data-job-action-menu="${job.id}">
@@ -617,9 +693,7 @@ async function renderJobs() {
                                   : ""
                               }
                               <button class="icon-button" data-job-logs="${job.id}" aria-label="Logs" title="Logs">
-                                <svg viewBox="0 0 24 24" aria-hidden="true">
-                                  <path d="M6 2h8l4 4v16H6V2Zm8 1.5V7h3.5L14 3.5ZM8.5 10h7v1.6h-7V10Zm0 3h7v1.6h-7V13Zm0 3h5.2v1.6H8.5V16Z"/>
-                                </svg>
+                                🧾
                                 <span class="icon-label">Logs</span>
                               </button>
                             </div>
@@ -686,6 +760,12 @@ async function renderJobs() {
   const reenqueueHealthFailed = document.getElementById("reenqueue-health-failed");
   const reenqueueFailed = document.getElementById("reenqueue-transcode-failed");
   const resetJobs = document.getElementById("reset-jobs");
+  const toggleDeletedJobs = document.getElementById("toggle-deleted-jobs");
+
+  toggleDeletedJobs?.addEventListener("change", async () => {
+    showDeletedJobs = toggleDeletedJobs.checked;
+    await renderJobs();
+  });
 
   reenqueueHealthFailed?.addEventListener("click", async () => {
     await fetch("/api/jobs/reenqueue", {
@@ -943,6 +1023,74 @@ function formatSubtitleList(value) {
   return "-";
 }
 
+function parseJsonArray(value) {
+  if (!value) return [];
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function formatBitrate(value) {
+  const bitrate = Number(value);
+  if (!Number.isFinite(bitrate) || bitrate <= 0) return "-";
+  const kbps = bitrate / 1000;
+  if (kbps < 1000) return `${kbps.toFixed(0)} kbps`;
+  return `${(kbps / 1000).toFixed(2)} Mbps`;
+}
+
+function formatFrameRate(value) {
+  const rate = Number(value);
+  if (!Number.isFinite(rate) || rate <= 0) return "-";
+  return `${rate.toFixed(2)} fps`;
+}
+
+function formatPathMetrics(entry) {
+  if (!entry) return "-";
+  const size = entry.size ? formatBytes(entry.size) : "-";
+  const container = normalizeContainerDisplay(entry.container ?? "-");
+  const videoCodec = entry.video_codec ?? "-";
+  const videoProfile = entry.video_profile ? ` ${entry.video_profile}` : "";
+  const resolution = entry.width && entry.height ? `${entry.width}x${entry.height}` : "-";
+  const frameRate = formatFrameRate(entry.frame_rate);
+  const overallBitrate = formatBitrate(entry.overall_bitrate ?? entry.video_bitrate ?? null);
+
+  const audioTrackValue = entry.audio_tracks;
+  const audioTracks =
+    audioTrackValue !== null && audioTrackValue !== undefined && audioTrackValue !== ""
+      ? `${audioTrackValue} audio`
+      : "-";
+  const audioCodecs = parseJsonArray(entry.audio_codecs).join("/");
+  const audioLangs = parseJsonArray(entry.audio_languages).join(", ");
+  const audioSummary =
+    audioTracks === "-"
+      ? "-"
+      : `${audioTracks}${audioCodecs ? ` ${audioCodecs}` : ""}${
+          audioLangs ? ` (${audioLangs})` : ""
+        }`;
+
+  const subtitleTrackValue = entry.subtitle_tracks;
+  const subTracks =
+    subtitleTrackValue !== null && subtitleTrackValue !== undefined && subtitleTrackValue !== ""
+      ? `${subtitleTrackValue} subs`
+      : "-";
+  const subCodecs = parseJsonArray(entry.subtitle_codecs).join("/");
+  const subLangs = parseJsonArray(entry.subtitle_languages).join(", ");
+  const subtitleSummary =
+    subTracks === "-"
+      ? "-"
+      : `${subTracks}${subCodecs ? ` ${subCodecs}` : ""}${
+          subLangs ? ` (${subLangs})` : ""
+        }`;
+
+  const duration = formatDurationSeconds(entry.duration_sec);
+  const frames = formatFrameCount(entry.frame_count);
+
+  return `${size} · ${container} · ${videoCodec}${videoProfile} · ${resolution} · ${frameRate} · ${overallBitrate} · ${audioSummary} · ${subtitleSummary} · ${duration} · ${frames}`;
+}
+
 function formatDurationSeconds(value) {
   const seconds = Number(value);
   if (!Number.isFinite(seconds) || seconds <= 0) return "-";
@@ -1134,7 +1282,15 @@ function buildJobCounts(stats) {
 }
 
 
-function renderGpuDetailsRow(nodeId, gpus, expanded, lastSeen, ramDetailText, ffmpegWarnings = []) {
+function renderGpuDetailsRow(
+  nodeId,
+  gpus,
+  expanded,
+  lastSeen,
+  ramDetailText,
+  ffmpegWarnings = [],
+  jobs = []
+) {
   if (!expanded) {
     return `<tr class="gpu-details hidden" data-gpu-details="${nodeId}"></tr>`;
   }
@@ -1172,6 +1328,27 @@ function renderGpuDetailsRow(nodeId, gpus, expanded, lastSeen, ramDetailText, ff
     })
     .join("");
 
+  const jobRows = Array.isArray(jobs) && jobs.length
+    ? jobs
+        .map((job) => {
+          const name = job.path ? job.path.split(/[/\\]/).pop() : "-";
+          const progress = typeof job.progress === "number" ? `${Math.round(job.progress)}%` : "-";
+          const updated = job.updated_at ? new Date(job.updated_at).toLocaleString() : "-";
+          const hardware = job.accelerator && job.accelerator !== "cpu"
+            ? `${job.processing_type ?? "gpu"} (${job.accelerator})`
+            : job.processing_type ?? "cpu";
+          return `<tr>
+            <td>${name}</td>
+            <td>${job.type ?? "-"}</td>
+            <td>${hardware ?? "-"}</td>
+            <td>${job.status ?? "-"}</td>
+            <td>${progress}</td>
+            <td>${updated}</td>
+          </tr>`;
+        })
+        .join("")
+    : `<tr><td colspan="6"><span class="muted">No active jobs.</span></td></tr>`;
+
   return `
     <tr class="gpu-details" data-gpu-details="${nodeId}">
       <td colspan="8">
@@ -1192,6 +1369,17 @@ function renderGpuDetailsRow(nodeId, gpus, expanded, lastSeen, ramDetailText, ff
             ${rows}
           </tbody>
         </table>
+        <div class="gpu-details-jobs">
+          <div class="muted">Jobs</div>
+          <table class="table subtable">
+            <thead>
+              <tr><th>File</th><th>Type</th><th>Hardware</th><th>Status</th><th>Progress</th><th>Updated</th></tr>
+            </thead>
+            <tbody>
+              ${jobRows}
+            </tbody>
+          </table>
+        </div>
       </td>
     </tr>
   `;
@@ -1202,14 +1390,16 @@ async function startAutoRefresh() {
 
   while (token === refreshToken) {
     try {
-      if (!isUserEditing()) {
-        if (activeView === "trees") {
-          await renderSidebarLists();
-          await new Promise((resolve) => setTimeout(resolve, getAutoRefreshInterval()));
-          continue;
-        }
+      await renderSidebarLists();
+      await checkHealth();
+      if (activeView === "trees") {
+        await new Promise((resolve) => setTimeout(resolve, getAutoRefreshInterval()));
+        continue;
+      }
+
+      if (!isUserEditingIn(view)) {
         const scrollTop = view.scrollTop;
-        await renderSidebarLists();
+        viewScrollCache.set(activeView, scrollTop);
         await routes[activeView]();
         view.scrollTop = scrollTop;
       }
@@ -1293,15 +1483,31 @@ function isUserEditing() {
     isTreeModalOpen ||
     isTreeAssignModalOpen ||
     isNodeSettingsModalOpen ||
+    isServerKeysModalOpen ||
     isTreeDesignerActive
   ) {
     return true;
   }
   const tag = active.tagName?.toLowerCase();
   if (tag === "input" || tag === "textarea" || tag === "select") {
-    return view.contains(active);
+    return true;
+  }
+  const selection = window.getSelection?.();
+  if (selection && !selection.isCollapsed) {
+    return true;
   }
   return false;
+}
+
+function isUserEditingIn(container) {
+  const active = document.activeElement;
+  if (active && container?.contains(active)) return true;
+  const selection = window.getSelection?.();
+  if (!selection || selection.isCollapsed) return false;
+  const range = selection.rangeCount ? selection.getRangeAt(0) : null;
+  const node = range?.commonAncestorContainer;
+  const element = node?.nodeType === 1 ? node : node?.parentElement;
+  return Boolean(element && container?.contains(element));
 }
 
 function renderLibraryDetailsRow(lib, expanded) {
@@ -1322,57 +1528,168 @@ function renderLibraryDetailsRow(lib, expanded) {
   `;
 }
 
+function getLatestPathFromList(paths, fallbackPath) {
+  if (Array.isArray(paths) && paths.length) {
+    const normalized = paths
+      .map((entry) => (typeof entry === "string" ? { path: entry } : entry))
+      .filter((entry) => entry?.path);
+    if (normalized.length) {
+      const sorted = normalized
+        .slice()
+        .sort((a, b) =>
+          String(b.updated_at ?? b.created_at ?? "").localeCompare(
+            String(a.updated_at ?? a.created_at ?? "")
+          )
+        );
+      return sorted[0]?.path ?? normalized[normalized.length - 1].path;
+    }
+  }
+  return fallbackPath || "";
+}
+
+function pickInitialPathEntry(entries) {
+  const list = Array.isArray(entries) ? entries.slice() : [];
+  if (!list.length) return null;
+  list.sort((a, b) => {
+    const created = String(a.created_at ?? "").localeCompare(String(b.created_at ?? ""));
+    if (created !== 0) return created;
+    return String(a.updated_at ?? "").localeCompare(String(b.updated_at ?? ""));
+  });
+  return list[0] ?? null;
+}
+
+function pickFinalPathEntry(entries) {
+  const list = Array.isArray(entries) ? entries.slice() : [];
+  if (!list.length) return null;
+  list.sort((a, b) => {
+    const created = String(a.created_at ?? "").localeCompare(String(b.created_at ?? ""));
+    if (created !== 0) return created;
+    return String(a.updated_at ?? "").localeCompare(String(b.updated_at ?? ""));
+  });
+  return list[list.length - 1] ?? null;
+}
+
 async function renderLibraryFiles(libId, offset) {
   const container = view.querySelector(`[data-library-files='${libId}']`);
   if (!container) return;
 
-  const data = await fetchJson(`/api/libraries/${libId}/files?offset=${offset}&limit=25`);
+  const includeDeleted = libraryFormState.showDeleted === true;
+  const data = await fetchJson(
+    `/api/libraries/${libId}/files?offset=${offset}&limit=25${includeDeleted ? "&includeDeleted=true" : ""}`
+  );
   const total = data.total ?? 0;
   const files = data.files ?? [];
   const page = Math.floor(offset / 25);
   const totalPages = Math.max(Math.ceil(total / 25), 1);
+  const debugMode = Boolean(appConfig?.debug);
 
   container.innerHTML = `
     <div class="library-files-header">
       <div class="muted">Showing ${offset + 1}-${Math.min(offset + 25, total)} of ${total}</div>
       <div class="pager">
-        <button class="ghost" data-page-prev="${libId}" ${page === 0 ? "disabled" : ""}>Prev</button>
+        <button class="ghost" data-page-prev="${libId}" ${page === 0 ? "disabled" : ""} aria-label="Previous page" title="Previous page">⏮</button>
         <span class="muted">Page ${page + 1} / ${totalPages}</span>
-        <button class="ghost" data-page-next="${libId}" ${page + 1 >= totalPages ? "disabled" : ""}>Next</button>
+        <button class="ghost" data-page-next="${libId}" ${page + 1 >= totalPages ? "disabled" : ""} aria-label="Next page" title="Next page">⏭</button>
       </div>
     </div>
-    <table class="table subtable">
+    <table class="table subtable library-subtable">
       <thead>
-        <tr><th>Name</th><th>Status</th><th>Initial</th><th>Final</th><th>New Name</th></tr>
+        <tr><th>Name</th><th>Status</th><th>Initial</th><th>Final</th>${
+          debugMode ? "<th>Actions</th>" : ""
+        }</tr>
       </thead>
       <tbody>
         ${files
           .map((file) => {
-            const name = file.path ? file.path.split(/[/\\]/).pop() : "-";
-            const initialSize = formatBytes(file.initial_size ?? file.size ?? 0);
-            const initialContainer = normalizeContainerDisplay(file.initial_container ?? "-");
-            const initialCodec = file.initial_codec ?? "-";
-            const initialAudio = file.initial_audio_codec ?? "-";
-            const initialSubs = formatSubtitleList(file.initial_subtitles);
-            const initialDuration = formatDurationSeconds(file.initial_duration_sec);
-            const initialFrames = formatFrameCount(file.initial_frame_count);
-            const finalSize = file.final_size ? formatBytes(file.final_size) : "-";
-            const finalContainer = normalizeContainerDisplay(file.final_container ?? "-");
-            const finalCodec = file.final_codec ?? "-";
-            const finalAudio = file.final_audio_codec ?? "-";
-            const finalSubs = formatSubtitleList(file.final_subtitles);
-            const finalDuration = formatDurationSeconds(file.final_duration_sec);
-            const finalFrames = formatFrameCount(file.final_frame_count);
-            const newName = file.new_path ? file.new_path.split(/[/\\]/).pop() : "-";
-            const initialText = `${initialSize} · ${initialContainer} · ${initialCodec} · ${initialAudio} · ${initialSubs} · ${initialDuration} · ${initialFrames}`;
-            const finalText = `${finalSize} · ${finalContainer} · ${finalCodec} · ${finalAudio} · ${finalSubs} · ${finalDuration} · ${finalFrames}`;
+            const latestPath = getLatestPathFromList(file.paths, file.new_path ?? file.path);
+            const name = latestPath ? latestPath.split(/[/\\]/).pop() : "-";
+            const paths = Array.isArray(file.paths) ? file.paths : [];
+            const pathList = paths
+              .map((entry) => (typeof entry === "string" ? { path: entry } : entry))
+              .filter((entry) => entry?.path);
+            const initialEntry = pickInitialPathEntry(pathList);
+            const finalEntry = pickFinalPathEntry(pathList);
+            const initialMetrics = formatPathMetrics(initialEntry);
+            const finalMetrics = formatPathMetrics(finalEntry);
+            const initialText =
+              initialMetrics !== "-"
+                ? initialMetrics
+                : formatPathMetrics({
+                    size: file.initial_size ?? file.size,
+                    container: file.initial_container,
+                    video_codec: file.initial_codec,
+                    audio_codecs: file.initial_audio_codec
+                      ? JSON.stringify([file.initial_audio_codec])
+                      : null,
+                    subtitle_codecs: file.initial_subtitles,
+                    duration_sec: file.initial_duration_sec,
+                    frame_count: file.initial_frame_count,
+                  });
+            const finalText =
+              finalMetrics !== "-"
+                ? finalMetrics
+                : formatPathMetrics({
+                    size: file.final_size,
+                    container: file.final_container,
+                    video_codec: file.final_codec,
+                    audio_codecs: file.final_audio_codec
+                      ? JSON.stringify([file.final_audio_codec])
+                      : null,
+                    subtitle_codecs: file.final_subtitles,
+                    duration_sec: file.final_duration_sec,
+                    frame_count: file.final_frame_count,
+                  });
             return `
               <tr>
-                <td title="${file.path ?? ""}">${name}</td>
+                <td>
+                  <div class="library-file-name">
+                    <button class="ghost expand-toggle" data-expand-file="${file.id}" aria-expanded="false" title="Show files">+</button>
+                    <span title="${latestPath ?? ""}">${name}</span>
+                  </div>
+                </td>
                 <td>${file.status}</td>
                 <td>${initialText}</td>
                 <td>${finalText}</td>
-                <td title="${file.new_path ?? ""}">${newName}</td>
+                ${
+                  debugMode
+                    ? `<td>
+                        <button class="icon-button danger" data-file-delete="${file.id}" data-file-library="${libId}" aria-label="Delete" title="Delete">
+                          🗑
+                          <span class="icon-label">Delete</span>
+                        </button>
+                      </td>`
+                    : ""
+                }
+              </tr>
+              <tr class="library-file-paths hidden" data-file-paths="${file.id}">
+                <td colspan="${debugMode ? 5 : 4}">
+                  <div class="file-path-list">
+                    ${pathList.length
+                      ? pathList
+                          .map((entry) => {
+                            const fileName = entry.path.split(/[/\\]/).pop();
+                            const metrics = formatPathMetrics(entry);
+                            const encodedPath = encodeURIComponent(entry.path);
+                            return `
+                              <div class="file-path-item">
+                                <span class="muted">${fileName}</span>
+                                <span class="file-path-text">${entry.path}</span>
+                                <span class="file-path-metrics">${metrics}</span>
+                                ${
+                                  debugMode
+                                    ? `<button class="icon-button danger" data-file-path-delete="${file.id}" data-file-library="${libId}" data-file-path="${encodedPath}" aria-label="Delete path" title="Delete path">
+                                        🗑
+                                        <span class="icon-label">Delete path</span>
+                                      </button>`
+                                    : ""
+                                }
+                              </div>
+                            `;
+                          })
+                          .join("")
+                      : `<div class="muted">No file paths recorded.</div>`}
+                  </div>
+                </td>
               </tr>
             `;
           })
@@ -1392,6 +1709,48 @@ async function renderLibraryFiles(libId, offset) {
     const nextOffset = offset + 25;
     libraryFilesPage.set(libId, page + 1);
     await renderLibraryFiles(libId, nextOffset);
+  });
+
+  const expandButtons = container.querySelectorAll("button[data-expand-file]");
+  expandButtons.forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const fileId = btn.getAttribute("data-expand-file");
+      if (!fileId) return;
+      const row = container.querySelector(`[data-file-paths='${fileId}']`);
+      if (!row) return;
+      const isHidden = row.classList.contains("hidden");
+      row.classList.toggle("hidden", !isHidden);
+      btn.textContent = isHidden ? "-" : "+";
+      btn.setAttribute("aria-expanded", isHidden ? "true" : "false");
+    });
+  });
+
+  const fileDeleteButtons = container.querySelectorAll("button[data-file-delete]");
+  fileDeleteButtons.forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const fileId = btn.getAttribute("data-file-delete");
+      const libraryId = btn.getAttribute("data-file-library");
+      if (!fileId || !libraryId) return;
+      if (!confirm("Delete this library entry? This is a hard delete.")) return;
+      await fetch(`/api/libraries/${libraryId}/files/${fileId}`, { method: "DELETE" });
+      await renderLibraryFiles(libId, offset);
+    });
+  });
+
+  const pathDeleteButtons = container.querySelectorAll("button[data-file-path-delete]");
+  pathDeleteButtons.forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const fileId = btn.getAttribute("data-file-path-delete");
+      const libraryId = btn.getAttribute("data-file-library");
+      const encodedPath = btn.getAttribute("data-file-path");
+      if (!fileId || !libraryId || !encodedPath) return;
+      if (!confirm("Delete this file path entry? This is a hard delete.")) return;
+      const pathValue = encodeURIComponent(decodeURIComponent(encodedPath));
+      await fetch(`/api/libraries/${libraryId}/files/${fileId}/paths?path=${pathValue}`, {
+        method: "DELETE",
+      });
+      await renderLibraryFiles(libId, offset);
+    });
   });
 }
 
@@ -1440,10 +1799,33 @@ function renderNodeSettingsModal() {
     <div class="modal-backdrop hidden" id="node-settings-backdrop">
       <div class="modal">
         <div class="modal-header">
-          <h3 id="node-settings-title">Node Limits</h3>
+          <h3 id="node-settings-title">Node Settings</h3>
           <button class="ghost" id="node-settings-close">Close</button>
         </div>
         <form class="form" id="node-settings-form">
+          <div class="key-block">
+            <label class="field-label">Node public key</label>
+            <textarea id="node-public-key" rows="5" readonly></textarea>
+            <div class="field-hint">Used by the server to verify node signatures.</div>
+            <div class="key-actions">
+              <button class="ghost" type="button" id="copy-node-public-key">Copy public key</button>
+              <button class="danger" type="button" id="generate-node-keys">Generate new keys</button>
+            </div>
+            <div class="key-output hidden" id="node-keys-output">
+              <label class="field-label">New public key</label>
+              <textarea id="node-generated-public-key" rows="6" readonly></textarea>
+              <label class="field-label">New private key (save this now)</label>
+              <textarea id="node-generated-private-key" rows="8" readonly></textarea>
+              <label class="field-label">.env block (paste into node .env)</label>
+              <textarea id="node-generated-env-block" rows="8" readonly></textarea>
+              <div class="key-actions">
+                <button class="ghost" type="button" id="copy-generated-public-key">Copy new public key</button>
+                <button class="ghost" type="button" id="copy-generated-private-key">Copy new private key</button>
+                <button class="ghost" type="button" id="copy-generated-env-block">Copy .env block</button>
+              </div>
+              <div class="field-hint">Private key is shown once. Update the node config and restart the node.</div>
+            </div>
+          </div>
           <div class="field-hint" id="gpu-targets-hint"></div>
           <label class="field-label" for="healthcheckSlotsCpu">Healthcheck CPU slots</label>
           <input id="healthcheckSlotsCpu" name="healthcheckSlotsCpu" placeholder="e.g. 2" />
@@ -1468,12 +1850,137 @@ function renderNodeSettingsModal() {
   `;
 }
 
+function renderServerKeysModal() {
+  return `
+    <div class="modal-backdrop hidden" id="server-keys-backdrop">
+      <div class="modal">
+        <div class="modal-header">
+          <h3>Server Key Management</h3>
+          <button class="ghost" id="server-keys-close">Close</button>
+        </div>
+        <div class="key-block">
+          <label class="field-label">Server public key</label>
+          <textarea id="server-public-key" rows="6" readonly></textarea>
+          <div class="field-hint">Nodes use this to verify server responses.</div>
+          <div class="key-actions">
+            <button class="ghost" type="button" id="copy-server-public-key">Copy public key</button>
+            <button class="danger" type="button" id="generate-server-keys">Generate new keys</button>
+          </div>
+          <div class="key-output hidden" id="server-keys-output">
+            <label class="field-label">New public key</label>
+            <textarea id="server-generated-public-key" rows="6" readonly></textarea>
+            <label class="field-label">New private key (save this now)</label>
+            <textarea id="server-generated-private-key" rows="8" readonly></textarea>
+            <label class="field-label">.env block (paste into server .env)</label>
+            <textarea id="server-generated-env-block" rows="6" readonly></textarea>
+            <div class="key-actions">
+              <button class="ghost" type="button" id="copy-server-generated-public">Copy new public key</button>
+              <button class="ghost" type="button" id="copy-server-generated-private">Copy new private key</button>
+              <button class="ghost" type="button" id="copy-server-generated-env">Copy .env block</button>
+            </div>
+            <div class="field-hint">Private key is shown once. Restart the server after updating config.</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+async function openServerKeysModal() {
+  const backdrop = document.getElementById("server-keys-backdrop");
+  if (!backdrop) return;
+  try {
+    const info = await fetchJson("/api/server/keys");
+    serverKeysState.publicKey = info?.publicKey ?? "";
+  } catch {
+    serverKeysState.publicKey = "";
+  }
+  const publicKeyEl = document.getElementById("server-public-key");
+  if (publicKeyEl) publicKeyEl.value = serverKeysState.publicKey;
+
+  const output = document.getElementById("server-keys-output");
+  if (output) output.classList.add("hidden");
+  const generatedPublic = document.getElementById("server-generated-public-key");
+  const generatedPrivate = document.getElementById("server-generated-private-key");
+  const envBlock = document.getElementById("server-generated-env-block");
+  if (generatedPublic) generatedPublic.value = "";
+  if (generatedPrivate) generatedPrivate.value = "";
+  if (envBlock) envBlock.value = "";
+
+  backdrop.classList.remove("hidden");
+  isServerKeysModalOpen = true;
+}
+
+function closeServerKeysModal() {
+  const backdrop = document.getElementById("server-keys-backdrop");
+  if (!backdrop) return;
+  backdrop.classList.add("hidden");
+  isServerKeysModalOpen = false;
+}
+
+function bindServerKeysModal() {
+  const backdrop = document.getElementById("server-keys-backdrop");
+  const closeBtn = document.getElementById("server-keys-close");
+  const generateBtn = document.getElementById("generate-server-keys");
+  const copyPublicBtn = document.getElementById("copy-server-public-key");
+  const copyGenPublicBtn = document.getElementById("copy-server-generated-public");
+  const copyGenPrivateBtn = document.getElementById("copy-server-generated-private");
+  const copyEnvBtn = document.getElementById("copy-server-generated-env");
+  if (!backdrop || !closeBtn) return;
+
+  closeBtn.addEventListener("click", () => closeServerKeysModal());
+  backdrop.addEventListener("click", (event) => {
+    if (event.target === backdrop) closeServerKeysModal();
+  });
+
+  generateBtn?.addEventListener("click", async () => {
+    if (!confirm("Generate new server keys? Nodes must be updated with the new public key.")) return;
+    const res = await fetch("/api/server/keys", { method: "POST" });
+    if (!res.ok) {
+      const message = await res.text();
+      alert(message || "Failed to generate server keys.");
+      return;
+    }
+    const payload = await res.json();
+    const output = document.getElementById("server-keys-output");
+    const publicKeyEl = document.getElementById("server-public-key");
+    const generatedPublic = document.getElementById("server-generated-public-key");
+    const generatedPrivate = document.getElementById("server-generated-private-key");
+    const envBlock = document.getElementById("server-generated-env-block");
+    if (generatedPublic) generatedPublic.value = payload.publicKey ?? "";
+    if (generatedPrivate) generatedPrivate.value = payload.privateKey ?? "";
+    if (envBlock) envBlock.value = payload.envBlock ?? "";
+    if (publicKeyEl) publicKeyEl.value = payload.publicKey ?? "";
+    if (output) output.classList.remove("hidden");
+    serverKeysState.publicKey = payload.publicKey ?? "";
+  });
+
+  copyPublicBtn?.addEventListener("click", () => copyFieldValue("server-public-key"));
+  copyGenPublicBtn?.addEventListener("click", () => copyFieldValue("server-generated-public-key"));
+  copyGenPrivateBtn?.addEventListener("click", () => copyFieldValue("server-generated-private-key"));
+  copyEnvBtn?.addEventListener("click", () => copyFieldValue("server-generated-env-block"));
+}
+
+function ensureServerSettingsModal() {
+  if (document.getElementById("server-keys-backdrop")) return;
+  document.body.insertAdjacentHTML("beforeend", renderServerKeysModal());
+}
+
+function bindServerSettingsButton() {
+  const button = document.getElementById("server-settings-button");
+  if (!button) return;
+  button.addEventListener("click", async () => {
+    await openServerKeysModal();
+  });
+  bindServerKeysModal();
+}
+
 function openNodeSettingsModal(node) {
   const backdrop = document.getElementById("node-settings-backdrop");
   if (!backdrop || !node) return;
   const form = document.getElementById("node-settings-form");
   const title = document.getElementById("node-settings-title");
-  if (title) title.textContent = `Node Limits: ${node.name}`;
+  if (title) title.textContent = `Node Settings: ${node.name}`;
 
   const settings = node.settings ?? {};
   const gpuCount = Array.isArray(node.hardware?.gpus) ? node.hardware.gpus.length : 0;
@@ -1491,6 +1998,7 @@ function openNodeSettingsModal(node) {
       transcodeGpuTargets: normalizeGpuTargetList(settings.transcodeGpuTargets ?? "", gpuCount),
     },
     gpuCount,
+    publicKey: node.public_key ?? "",
   };
 
   if (form) {
@@ -1511,6 +2019,16 @@ function openNodeSettingsModal(node) {
       : "No GPUs detected for this node.";
   }
 
+  const publicKeyEl = document.getElementById("node-public-key");
+  if (publicKeyEl) publicKeyEl.value = nodeSettingsState.publicKey || "";
+
+  const output = document.getElementById("node-keys-output");
+  if (output) output.classList.add("hidden");
+  const generatedPublic = document.getElementById("node-generated-public-key");
+  const generatedPrivate = document.getElementById("node-generated-private-key");
+  if (generatedPublic) generatedPublic.value = "";
+  if (generatedPrivate) generatedPrivate.value = "";
+
   backdrop.classList.remove("hidden");
   isNodeSettingsModalOpen = true;
 }
@@ -1526,12 +2044,50 @@ function bindNodeSettingsModal() {
   const backdrop = document.getElementById("node-settings-backdrop");
   const form = document.getElementById("node-settings-form");
   const closeBtn = document.getElementById("node-settings-close");
+  const generateBtn = document.getElementById("generate-node-keys");
+  const copyPublicBtn = document.getElementById("copy-node-public-key");
+  const copyNewPublicBtn = document.getElementById("copy-generated-public-key");
+  const copyNewPrivateBtn = document.getElementById("copy-generated-private-key");
+  const copyEnvBlockBtn = document.getElementById("copy-generated-env-block");
   if (!backdrop || !form || !closeBtn) return;
 
   closeBtn.addEventListener("click", () => closeNodeSettingsModal());
   backdrop.addEventListener("click", (event) => {
     if (event.target === backdrop) closeNodeSettingsModal();
   });
+
+  generateBtn?.addEventListener("click", async () => {
+    if (!nodeSettingsState.nodeId) return;
+    if (!confirm("Generate new keys for this node? The node must be updated with the new private key.")) return;
+    const res = await fetch(`/api/nodes/${encodeURIComponent(nodeSettingsState.nodeId)}/keys`, {
+      method: "POST",
+    });
+    if (!res.ok) return;
+    const payload = await res.json();
+    const output = document.getElementById("node-keys-output");
+    const publicKeyEl = document.getElementById("node-public-key");
+    const generatedPublic = document.getElementById("node-generated-public-key");
+    const generatedPrivate = document.getElementById("node-generated-private-key");
+    const envBlock = document.getElementById("node-generated-env-block");
+    if (generatedPublic) generatedPublic.value = payload.publicKey ?? "";
+    if (generatedPrivate) generatedPrivate.value = payload.privateKey ?? "";
+    if (envBlock) {
+      const serverPublicKey = payload.serverPublicKey ?? "";
+      envBlock.value = buildNodeEnvBlock({
+        nodePrivateKey: payload.privateKey ?? "",
+        nodePublicKey: payload.publicKey ?? "",
+        serverPublicKey,
+      });
+    }
+    if (publicKeyEl) publicKeyEl.value = payload.publicKey ?? "";
+    if (output) output.classList.remove("hidden");
+    nodeSettingsState.publicKey = payload.publicKey ?? "";
+  });
+
+  copyPublicBtn?.addEventListener("click", () => copyFieldValue("node-public-key"));
+  copyNewPublicBtn?.addEventListener("click", () => copyFieldValue("node-generated-public-key"));
+  copyNewPrivateBtn?.addEventListener("click", () => copyFieldValue("node-generated-private-key"));
+  copyEnvBlockBtn?.addEventListener("click", () => copyFieldValue("node-generated-env-block"));
 
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
@@ -1556,6 +2112,42 @@ function bindNodeSettingsModal() {
     closeNodeSettingsModal();
     await renderNodes();
   });
+}
+
+function copyFieldValue(fieldId) {
+  const field = document.getElementById(fieldId);
+  if (!field) return;
+  const value = field.value ?? "";
+  if (!value) return;
+  navigator.clipboard?.writeText(value).catch(() => {
+    field.select();
+    document.execCommand("copy");
+  });
+}
+
+function encodeEnvValue(value) {
+  if (!value) return "";
+  const text = String(value).trim();
+  if (!text) return "";
+  try {
+    const encoded = btoa(unescape(encodeURIComponent(text)));
+    return `base64:${encoded}`;
+  } catch {
+    return text.replace(/\r?\n/g, "\\n");
+  }
+}
+
+function buildNodeEnvBlock({ nodePrivateKey, nodePublicKey, serverPublicKey }) {
+  return [
+    "# Node private key (PEM, file path, or base64:...)",
+    `CODARR_NODE_PRIVATE_KEY=${encodeEnvValue(nodePrivateKey)}`,
+    "",
+    "# Node public key (PEM, file path, or base64:...)",
+    `CODARR_NODE_PUBLIC_KEY=${encodeEnvValue(nodePublicKey)}`,
+    "",
+    "# Server public key (PEM, file path, or base64:...)",
+    `CODARR_SERVER_PUBLIC_KEY=${encodeEnvValue(serverPublicKey)}`,
+  ].join("\n");
 }
 
 function parseOptionalNumber(value) {

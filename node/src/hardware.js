@@ -1,8 +1,10 @@
 import os from "os";
 import si from "systeminformation";
 import { execSync } from "child_process";
+import crypto from "crypto";
 import fs from "fs";
 import path from "path";
+import { fileURLToPath } from "url";
 import { config } from "./config.js";
 import { getGpuWorkload } from "./gpuWorkload.js";
 
@@ -20,11 +22,25 @@ export function detectPlatform() {
 }
 
 export async function getHardwareInfo() {
+  const cacheEnabled = String(process.env.CODARR_HARDWARE_CACHE ?? "true").toLowerCase() !== "false";
+  const cacheMaxAgeHours = Number(process.env.CODARR_HARDWARE_CACHE_MAX_AGE_HOURS ?? 24);
+  const cachePath = resolveHardwareCachePath();
+
   const [cpu, mem, graphics] = await Promise.all([
     si.cpu(),
     si.mem(),
     si.graphics(),
   ]);
+
+  const signature = buildHardwareSignature({ cpu, mem, graphics });
+  if (cacheEnabled) {
+    const cached = readHardwareCache(cachePath, signature, cacheMaxAgeHours);
+    if (cached) {
+      console.log(`[startup] Hardware cache hit (${cachePath}).`);
+      return cached;
+    }
+    console.log(`[startup] Hardware cache miss (${cachePath}).`);
+  }
 
   const hwaccels = detectHwaccels();
   const detectedDiscrete = detectDiscreteGpus();
@@ -34,7 +50,7 @@ export async function getHardwareInfo() {
   const gpus = buildGpuInventory({ detectedDiscrete, controllers, externalMetrics });
   const ffmpegWarnings = probeFfmpegAccelerators(gpus);
 
-  return {
+  const hardware = {
     platform: detectPlatform(),
     cpu: {
       manufacturer: cpu.manufacturer,
@@ -51,6 +67,102 @@ export async function getHardwareInfo() {
     gpus,
     ffmpegWarnings,
   };
+
+  if (cacheEnabled) {
+    writeHardwareCache(cachePath, signature, hardware);
+  }
+
+  return hardware;
+}
+
+function resolveHardwareCachePath() {
+  const override = String(process.env.CODARR_HARDWARE_CACHE_PATH ?? "").trim();
+  if (override) return override;
+  const baseDir = path.join(os.tmpdir(), "codarr");
+  try {
+    fs.mkdirSync(baseDir, { recursive: true });
+  } catch {
+    // ignore
+  }
+  return path.join(baseDir, "hardware-cache.json");
+}
+
+function buildHardwareSignature({ cpu, mem, graphics }) {
+  const controllers = (graphics?.controllers ?? []).map((controller) => ({
+    model: controller.model ?? null,
+    vendor: controller.vendor ?? null,
+    vram: controller.vram ?? null,
+    bus: controller.bus ?? null,
+    driver: controller.driverVersion ?? controller.driver ?? null,
+  }));
+
+  const toolPaths = [
+    config.ffmpegPath,
+    config.ffprobePath,
+    config.handbrakeCliPath,
+    config.mkvEditPath,
+    config.intelGpuTopPath,
+    config.intelXpuSmiPath,
+    config.radeontopPath,
+    config.amdSmiPath,
+  ].filter(Boolean);
+
+  const toolStats = toolPaths.map((toolPath) => {
+    try {
+      const stat = fs.statSync(toolPath);
+      return { path: toolPath, mtimeMs: stat.mtimeMs, size: stat.size };
+    } catch {
+      return { path: toolPath, mtimeMs: null, size: null };
+    }
+  });
+
+  const signaturePayload = {
+    platform: detectPlatform(),
+    cpu: {
+      manufacturer: cpu.manufacturer,
+      brand: cpu.brand,
+      physicalCores: cpu.physicalCores,
+      cores: cpu.cores,
+      speedGHz: cpu.speed,
+    },
+    memory: { totalBytes: mem.total },
+    controllers,
+    toolStats,
+  };
+
+  return crypto.createHash("sha256").update(JSON.stringify(signaturePayload)).digest("hex");
+}
+
+function readHardwareCache(cachePath, signature, maxAgeHours) {
+  if (!cachePath) return null;
+  try {
+    if (!fs.existsSync(cachePath)) return null;
+    const raw = fs.readFileSync(cachePath, "utf8");
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed?.signature || parsed.signature !== signature) return null;
+    if (maxAgeHours > 0 && parsed.created_at) {
+      const ageMs = Date.now() - Date.parse(parsed.created_at);
+      if (Number.isFinite(ageMs) && ageMs > maxAgeHours * 3600 * 1000) return null;
+    }
+    return parsed.hardware ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function writeHardwareCache(cachePath, signature, hardware) {
+  if (!cachePath) return;
+  try {
+    fs.writeFileSync(
+      cachePath,
+      JSON.stringify({ signature, created_at: new Date().toISOString(), hardware }, null, 2),
+      "utf8"
+    );
+    console.log(`[startup] Hardware cache saved (${cachePath}).`);
+  } catch {
+    // ignore
+  }
 }
 
 export async function collectMetrics() {
@@ -340,7 +452,7 @@ function listFfmpegEncoders(ffmpegPath) {
 function runFfmpegProbe(ffmpegPath, encoderArgs) {
   try {
     execSync(
-      `"${ffmpegPath}" -hide_banner -v error -f lavfi -i testsrc2=size=128x128:rate=1 -frames:v 1 ${encoderArgs.join(" ")} -f null -`,
+      `"${ffmpegPath}" -hide_banner -v error -f lavfi -i testsrc2=size=640x360:rate=1 -frames:v 1 -pix_fmt yuv420p ${encoderArgs.join(" ")} -f null -`,
       { stdio: ["ignore", "pipe", "pipe"] }
     );
     return { ok: true, error: null };

@@ -26,6 +26,18 @@ Environment variables:
 - `CODARR_JOB_SLOTS_CPU` (default 1)
 - `CODARR_JOB_SLOTS_GPU` (default 0)
 
+### Request signing
+
+If the server enforces node request signing, configure the node keys:
+- `CODARR_NODE_PRIVATE_KEY` (PEM, file path, or base64:...)
+- `CODARR_NODE_PUBLIC_KEY` (PEM, file path, or base64:...)
+- `CODARR_SERVER_PUBLIC_KEY` (PEM, file path, or base64:...)
+- `CODARR_API_SIGNATURE_SKEW_SEC` (default `300` seconds)
+
+Generate a node key pair (Ed25519 example):
+- `openssl genpkey -algorithm ed25519 -out node_private.pem`
+- `openssl pkey -in node_private.pem -pubout -out node_public.pem`
+
 Sample additions:
 - `CODARR_TEMP_DIR=/srv/codarr/tmp`
 - `CODARR_PATH_MAPS=[{"from":"/srv/Media","to":"//192.168.51.2/srv/Media"}]`

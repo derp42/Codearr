@@ -106,9 +106,39 @@ function initDbOnce() {
       final_duration_sec REAL,
       final_frame_count INTEGER,
       new_path TEXT,
+      deleted_at TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       FOREIGN KEY(library_id) REFERENCES libraries(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS file_paths (
+      file_id TEXT NOT NULL,
+      path TEXT NOT NULL UNIQUE,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      deleted_at TEXT,
+      size INTEGER,
+      container TEXT,
+      video_codec TEXT,
+      video_profile TEXT,
+      width INTEGER,
+      height INTEGER,
+      frame_rate REAL,
+      video_bitrate INTEGER,
+      audio_bitrate INTEGER,
+      overall_bitrate INTEGER,
+      duration_sec REAL,
+      frame_count INTEGER,
+      audio_tracks INTEGER,
+      subtitle_tracks INTEGER,
+      audio_codecs TEXT,
+      subtitle_codecs TEXT,
+      audio_languages TEXT,
+      subtitle_languages TEXT,
+      audio_tracks_json TEXT,
+      subtitle_tracks_json TEXT,
+      FOREIGN KEY(file_id) REFERENCES files(id)
     );
 
     CREATE TABLE IF NOT EXISTS jobs (
@@ -123,6 +153,7 @@ function initDbOnce() {
       accelerator TEXT,
       transcode_payload TEXT,
       log_text TEXT,
+      deleted_at TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       FOREIGN KEY(file_id) REFERENCES files(id)
@@ -176,7 +207,8 @@ function initDbOnce() {
       metrics_json TEXT NOT NULL,
       hardware_json TEXT,
       settings_json TEXT,
-      tags_json TEXT
+      tags_json TEXT,
+      public_key TEXT
     );
   `);
 
@@ -194,6 +226,12 @@ function initDbOnce() {
 
   try {
     adapter.exec("ALTER TABLE nodes ADD COLUMN tags_json TEXT");
+  } catch {
+    // Column already exists
+  }
+
+  try {
+    adapter.exec("ALTER TABLE nodes ADD COLUMN public_key TEXT");
   } catch {
     // Column already exists
   }
@@ -333,6 +371,162 @@ function initDbOnce() {
   }
 
   try {
+    adapter.exec("ALTER TABLE files ADD COLUMN deleted_at TEXT");
+  } catch {
+    // Column already exists
+  }
+
+  try {
+    adapter.exec(
+      "CREATE TABLE IF NOT EXISTS file_paths (file_id TEXT NOT NULL, path TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, deleted_at TEXT, FOREIGN KEY(file_id) REFERENCES files(id))"
+    );
+  } catch {
+    // Table already exists
+  }
+
+  try {
+    adapter.exec("ALTER TABLE file_paths ADD COLUMN deleted_at TEXT");
+  } catch {
+    // Column already exists
+  }
+
+  try {
+    adapter.exec("ALTER TABLE file_paths ADD COLUMN size INTEGER");
+  } catch {
+    // Column already exists
+  }
+
+  try {
+    adapter.exec("ALTER TABLE file_paths ADD COLUMN container TEXT");
+  } catch {
+    // Column already exists
+  }
+
+  try {
+    adapter.exec("ALTER TABLE file_paths ADD COLUMN video_codec TEXT");
+  } catch {
+    // Column already exists
+  }
+
+  try {
+    adapter.exec("ALTER TABLE file_paths ADD COLUMN video_profile TEXT");
+  } catch {
+    // Column already exists
+  }
+
+  try {
+    adapter.exec("ALTER TABLE file_paths ADD COLUMN width INTEGER");
+  } catch {
+    // Column already exists
+  }
+
+  try {
+    adapter.exec("ALTER TABLE file_paths ADD COLUMN height INTEGER");
+  } catch {
+    // Column already exists
+  }
+
+  try {
+    adapter.exec("ALTER TABLE file_paths ADD COLUMN frame_rate REAL");
+  } catch {
+    // Column already exists
+  }
+
+  try {
+    adapter.exec("ALTER TABLE file_paths ADD COLUMN video_bitrate INTEGER");
+  } catch {
+    // Column already exists
+  }
+
+  try {
+    adapter.exec("ALTER TABLE file_paths ADD COLUMN audio_bitrate INTEGER");
+  } catch {
+    // Column already exists
+  }
+
+  try {
+    adapter.exec("ALTER TABLE file_paths ADD COLUMN overall_bitrate INTEGER");
+  } catch {
+    // Column already exists
+  }
+
+  try {
+    adapter.exec("ALTER TABLE file_paths ADD COLUMN duration_sec REAL");
+  } catch {
+    // Column already exists
+  }
+
+  try {
+    adapter.exec("ALTER TABLE file_paths ADD COLUMN frame_count INTEGER");
+  } catch {
+    // Column already exists
+  }
+
+  try {
+    adapter.exec("ALTER TABLE file_paths ADD COLUMN audio_tracks INTEGER");
+  } catch {
+    // Column already exists
+  }
+
+  try {
+    adapter.exec("ALTER TABLE file_paths ADD COLUMN subtitle_tracks INTEGER");
+  } catch {
+    // Column already exists
+  }
+
+  try {
+    adapter.exec("ALTER TABLE file_paths ADD COLUMN audio_codecs TEXT");
+  } catch {
+    // Column already exists
+  }
+
+  try {
+    adapter.exec("ALTER TABLE file_paths ADD COLUMN subtitle_codecs TEXT");
+  } catch {
+    // Column already exists
+  }
+
+  try {
+    adapter.exec("ALTER TABLE file_paths ADD COLUMN audio_languages TEXT");
+  } catch {
+    // Column already exists
+  }
+
+  try {
+    adapter.exec("ALTER TABLE file_paths ADD COLUMN subtitle_languages TEXT");
+  } catch {
+    // Column already exists
+  }
+
+  try {
+    adapter.exec("ALTER TABLE file_paths ADD COLUMN audio_tracks_json TEXT");
+  } catch {
+    // Column already exists
+  }
+
+  try {
+    adapter.exec("ALTER TABLE file_paths ADD COLUMN subtitle_tracks_json TEXT");
+  } catch {
+    // Column already exists
+  }
+
+  try {
+    adapter.exec(
+      "INSERT OR IGNORE INTO file_paths (file_id, path, created_at, updated_at) SELECT id, path, created_at, updated_at FROM files WHERE path IS NOT NULL AND path != ''"
+    );
+  } catch {
+    // ignore migration errors
+  }
+
+  try {
+    adapter.exec(
+      "INSERT OR IGNORE INTO file_paths (file_id, path, created_at, updated_at) SELECT id, new_path, created_at, updated_at FROM files WHERE new_path IS NOT NULL AND new_path != ''"
+    );
+  } catch {
+    // ignore migration errors
+  }
+
+  try {
     adapter.exec("ALTER TABLE jobs ADD COLUMN progress REAL");
   } catch {
     // Column already exists
@@ -364,6 +558,12 @@ function initDbOnce() {
 
   try {
     adapter.exec("ALTER TABLE jobs ADD COLUMN transcode_payload TEXT");
+  } catch {
+    // Column already exists
+  }
+
+  try {
+    adapter.exec("ALTER TABLE jobs ADD COLUMN deleted_at TEXT");
   } catch {
     // Column already exists
   }

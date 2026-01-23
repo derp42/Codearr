@@ -35,7 +35,7 @@ function parseBoolean(value, fallback) {
 
 export default {
   ...def,
-  async execute({ context, node, log }) {
+  async execute({ context, node, log, reportFileUpdate, ffprobeFile, buildPathMetrics }) {
     log?.("Replace original: start");
     const fs = await import("node:fs");
     const path = await import("node:path");
@@ -57,6 +57,25 @@ export default {
       `${path.basename(original)}${backupSuffix}`
     );
 
+    if (fs.existsSync(outputPath) && typeof ffprobeFile === "function") {
+      try {
+        const stats = fs.statSync(outputPath);
+        const probe = await ffprobeFile(outputPath);
+        const metrics = buildPathMetrics ? buildPathMetrics(stats, probe) : null;
+        reportFileUpdate?.(
+          { new_path: original, remove_path: outputPath },
+          "replace_original",
+          "Output will replace original",
+          null,
+          metrics ? [{ path: original, metrics }] : undefined
+        );
+      } catch {
+        reportFileUpdate?.({ new_path: original, remove_path: outputPath }, "replace_original", "Output will replace original");
+      }
+    } else {
+      reportFileUpdate?.({ new_path: original, remove_path: outputPath }, "replace_original", "Output will replace original");
+    }
+
     if (keepBackup && fs.existsSync(original)) {
       fs.renameSync(original, backupPath);
     } else if (fs.existsSync(original)) {
@@ -66,6 +85,24 @@ export default {
     fs.renameSync(outputPath, original);
     context.finalPath = original;
     context.backupPath = keepBackup ? backupPath : null;
+    if (fs.existsSync(original) && typeof ffprobeFile === "function") {
+      try {
+        const stats = fs.statSync(original);
+        const probe = await ffprobeFile(original);
+        const metrics = buildPathMetrics ? buildPathMetrics(stats, probe) : null;
+        reportFileUpdate?.(
+          { new_path: original, remove_path: outputPath },
+          "replace_original",
+          "Output replaced",
+          null,
+          metrics ? [{ path: original, metrics }] : undefined
+        );
+      } catch {
+        reportFileUpdate?.({ new_path: original, remove_path: outputPath }, "replace_original", "Output replaced");
+      }
+    } else {
+      reportFileUpdate?.({ new_path: original, remove_path: outputPath }, "replace_original", "Output replaced");
+    }
     log?.(`Original replaced${keepBackup ? " (backup created)" : ""}`);
     return { nextHandle: "out" };
   },

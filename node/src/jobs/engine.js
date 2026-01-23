@@ -260,6 +260,95 @@ async function ffprobeFile(filePath) {
   };
 }
 
+function buildPathMetrics(stats, probe) {
+  const streams = probe?.streams ?? [];
+  const format = probe?.format ?? {};
+  const videoStream = streams.find((s) => s.codec_type === "video") ?? {};
+  const audioStreams = streams.filter((s) => s.codec_type === "audio");
+  const subtitleStreams = streams.filter((s) => s.codec_type === "subtitle");
+
+  const audioCodecs = Array.from(new Set(audioStreams.map((s) => s.codec_name).filter(Boolean)));
+  const subtitleCodecs = Array.from(
+    new Set(subtitleStreams.map((s) => s.codec_name).filter(Boolean))
+  );
+
+  const audioLanguages = Array.from(
+    new Set(
+      audioStreams
+        .map((s) => s.tags?.language)
+        .filter(Boolean)
+        .map((value) => String(value))
+    )
+  );
+  const subtitleLanguages = Array.from(
+    new Set(
+      subtitleStreams
+        .map((s) => s.tags?.language)
+        .filter(Boolean)
+        .map((value) => String(value))
+    )
+  );
+
+  const audioBitrate = audioStreams
+    .map((s) => parseNumber(s.bit_rate))
+    .filter((value) => Number.isFinite(value))
+    .reduce((sum, value) => sum + value, 0) || null;
+  const videoBitrate = parseNumber(videoStream?.bit_rate);
+  const overallBitrate = parseNumber(format?.bit_rate) || null;
+  const durationSec = parseNumber(format?.duration) ?? probe?.durationSec ?? null;
+  const derivedOverallBitrate =
+    overallBitrate ??
+    (stats?.size && durationSec ? Math.round((stats.size * 8) / durationSec) : null);
+
+  const frameRate =
+    parseFrameRate(videoStream?.avg_frame_rate) ??
+    parseFrameRate(videoStream?.r_frame_rate) ??
+    null;
+
+  const audioTracksJson = audioStreams.map((s) => ({
+    index: s.index,
+    codec: s.codec_name ?? null,
+    profile: s.profile ?? null,
+    channels: s.channels ?? null,
+    channel_layout: s.channel_layout ?? null,
+    sample_rate: parseNumber(s.sample_rate),
+    bit_rate: parseNumber(s.bit_rate),
+    language: s.tags?.language ?? null,
+    title: s.tags?.title ?? null,
+  }));
+
+  const subtitleTracksJson = subtitleStreams.map((s) => ({
+    index: s.index,
+    codec: s.codec_name ?? null,
+    language: s.tags?.language ?? null,
+    title: s.tags?.title ?? null,
+    forced: s.disposition?.forced ?? null,
+  }));
+
+  return {
+    size: stats?.size ?? null,
+    container: probe?.container ?? null,
+    video_codec: videoStream?.codec_name ?? null,
+    video_profile: videoStream?.profile ?? null,
+    width: videoStream?.width ?? null,
+    height: videoStream?.height ?? null,
+    frame_rate: frameRate,
+    video_bitrate: Number.isFinite(videoBitrate) ? videoBitrate : null,
+    audio_bitrate: Number.isFinite(audioBitrate) ? audioBitrate : null,
+    overall_bitrate: Number.isFinite(derivedOverallBitrate) ? derivedOverallBitrate : null,
+    duration_sec: durationSec,
+    frame_count: probe?.frameCount ?? null,
+    audio_tracks: audioStreams.length,
+    subtitle_tracks: subtitleStreams.length,
+    audio_codecs: audioCodecs.length ? JSON.stringify(audioCodecs) : null,
+    subtitle_codecs: subtitleCodecs.length ? JSON.stringify(subtitleCodecs) : null,
+    audio_languages: audioLanguages.length ? JSON.stringify(audioLanguages) : null,
+    subtitle_languages: subtitleLanguages.length ? JSON.stringify(subtitleLanguages) : null,
+    audio_tracks_json: audioTracksJson.length ? JSON.stringify(audioTracksJson) : null,
+    subtitle_tracks_json: subtitleTracksJson.length ? JSON.stringify(subtitleTracksJson) : null,
+  };
+}
+
 function parseNumber(value) {
   const num = Number(value);
   return Number.isFinite(num) ? num : null;
@@ -728,10 +817,10 @@ function createJobApi(serverUrl) {
         { swallow: true }
       );
     },
-    async report(jobId, fileUpdates, stage, log, progress) {
+    async report(jobId, fileUpdates, stage, log, progress, pathUpdates) {
       await postWithRetry(
         "/api/jobs/report",
-        { jobId, fileUpdates, stage, log, progress },
+        { jobId, fileUpdates, stage, log, progress, pathUpdates },
         { swallow: true }
       );
     },
@@ -893,6 +982,8 @@ async function executeHealthcheck(job, api, streamer, gpus = []) {
       throw new Error(`Healthcheck failed (ffmpeg validation error)${detail}`);
     }
 
+    const pathMetrics = buildPathMetrics(stats, probe);
+    const remotePath = job.file_path ?? translatePath(inputPath, "toRemote");
     await api.report(
       job.id,
       {
@@ -906,7 +997,8 @@ async function executeHealthcheck(job, api, streamer, gpus = []) {
       },
       "healthcheck",
       `Healthcheck ok (container=${probe.container}, video=${probe.videoCodec}, audio=${probe.audioCodec})`,
-      100
+      100,
+      remotePath ? [{ path: remotePath, metrics: pathMetrics }] : undefined
     );
 
     streamer.log("healthcheck", "Healthcheck complete: success");
@@ -981,15 +1073,29 @@ async function executeTranscode(job, api, streamer) {
         const stage = context.currentStage ?? "ffmpeg";
         return api.progress(job.id, overall, stage, message);
       },
-      reportFileUpdate: (updates, stage, log, progress) => {
+      reportFileUpdate: (updates, stage, log, progress, pathUpdates) => {
         const mapped = updates && typeof updates === "object" ? { ...updates } : updates;
         if (mapped?.new_path) {
           mapped.new_path = translateToRemote(mapped.new_path);
         }
-        return api.report(job.id, mapped, stage, log, progress);
+        let mappedPathUpdates = pathUpdates;
+        if (mappedPathUpdates) {
+          const updatesList = Array.isArray(mappedPathUpdates)
+            ? mappedPathUpdates
+            : [mappedPathUpdates];
+          mappedPathUpdates = updatesList
+            .map((entry) => {
+              const pathValue = entry?.path ?? entry?.file_path ?? entry?.filePath ?? null;
+              if (!pathValue) return entry;
+              return { ...entry, path: translateToRemote(pathValue) };
+            })
+            .filter(Boolean);
+        }
+        return api.report(job.id, mapped, stage, log, progress, mappedPathUpdates);
       },
       requeueJob: (jobId, reason) => api.requeue(jobId, reason),
       elementRegistry,
+      buildPathMetrics,
     };
     const graph = payload.graph;
     // No full payload logging; per-element config is logged by each element as needed.
@@ -1115,6 +1221,7 @@ async function executeTranscode(job, api, streamer) {
       const stats = fs.statSync(finalPathLocal);
       const outputProbe = await ffprobeFile(finalPathLocal);
       const subtitleList = Array.from(new Set(outputProbe.subtitleCodecs ?? []));
+      const pathMetrics = buildPathMetrics(stats, outputProbe);
       await api.report(
         job.id,
         {
@@ -1130,7 +1237,8 @@ async function executeTranscode(job, api, streamer) {
         },
         "transcode",
         "Transcode finished",
-        100
+        100,
+        finalPathRemote ? [{ path: finalPathRemote, metrics: pathMetrics }] : undefined
       );
     } else if (!completedByElement) {
       await api.report(job.id, null, "transcode", "Tree completed successfully", 100);

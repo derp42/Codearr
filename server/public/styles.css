@@ -194,9 +194,35 @@ body {
   margin-bottom: 20px;
 }
 
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
 .status {
   font-size: 0.9rem;
   color: var(--muted);
+}
+
+.icon-button {
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(16, 22, 32, 0.9);
+  color: var(--text);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.1rem;
+  transition: border 0.2s ease, background 0.2s ease;
+}
+
+.icon-button:hover {
+  border-color: rgba(109, 125, 255, 0.6);
+  background: rgba(109, 125, 255, 0.18);
 }
 
 .card-grid {
@@ -361,6 +387,24 @@ body.ui-refreshing .card-link {
   overflow-y: auto;
 }
 
+.key-block textarea {
+  width: 100%;
+  min-height: 120px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
+    "Courier New", monospace;
+}
+
+.key-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.key-output {
+  margin-top: 12px;
+}
+
 .tree-modal {
   width: min(860px, 96vw);
 }
@@ -411,6 +455,68 @@ body.ui-refreshing .card-link {
   align-items: center;
   justify-content: space-between;
   margin-bottom: 8px;
+}
+
+.library-details td {
+  width: 100%;
+}
+
+.library-files {
+  width: 100%;
+}
+
+.library-file-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.expand-toggle {
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 600;
+  line-height: 1;
+}
+
+.library-file-paths td {
+  padding-top: 6px;
+}
+
+.file-path-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-left: 30px;
+}
+
+.file-path-item {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: baseline;
+}
+
+.file-path-text {
+  color: rgba(255, 255, 255, 0.75);
+  word-break: break-all;
+}
+
+.file-path-metrics {
+  color: rgba(255, 255, 255, 0.65);
+  font-size: 0.85rem;
+}
+
+.file-path-item button {
+  margin-left: auto;
+}
+
+.file-path-metrics {
+  color: rgba(255, 255, 255, 0.6);
+  font-size: 0.85rem;
 }
 
 .pager {
@@ -735,6 +841,12 @@ textarea {
   width: 95%;
   max-width: 95%;
   margin: 0 auto;
+}
+
+.library-designer-card {
+  height: auto;
+  width: 100%;
+  max-width: 100%;
 }
 
 .tree-designer-inner {
@@ -1074,6 +1186,38 @@ button.ghost {
   margin-top: 8px;
 }
 
+.library-subtable {
+  table-layout: fixed;
+}
+
+.library-subtable th:nth-child(1),
+.library-subtable td:nth-child(1) {
+  width: 20%;
+}
+
+.library-subtable th:nth-child(2),
+.library-subtable td:nth-child(2) {
+  width: 14%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.library-subtable th:nth-child(3),
+.library-subtable td:nth-child(3) {
+  width: 33%;
+}
+
+.library-subtable th:nth-child(4),
+.library-subtable td:nth-child(4) {
+  width: 33%;
+}
+
+.library-subtable th:nth-child(5),
+.library-subtable td:nth-child(5) {
+  width: 6%;
+}
+
 .hidden {
   display: none;
 }
@@ -1097,6 +1241,24 @@ button.primary {
   gap: 10px;
   flex-wrap: nowrap;
   width: 100%;
+}
+
+.library-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.node-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.gpu-details-jobs {
+  margin-top: 12px;
 }
 
 .table td {
@@ -1127,6 +1289,7 @@ button.primary {
   transform: scale(0.75);
   transform-origin: center;
   transition: opacity 0.2s ease, transform 0.2s ease;
+}
 
 .icon-button .icon-label {
   position: absolute;

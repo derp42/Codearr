@@ -1,5 +1,6 @@
 import fs from "fs/promises";
 import path from "path";
+import os from "os";
 import { fileURLToPath } from "url";
 import { config } from "./config.js";
 import { collectMetrics, detectPlatform, getHardwareInfo, startMetricsMonitor } from "./hardware.js";
@@ -11,10 +12,37 @@ const metricsMonitor = startMetricsMonitor(5000);
 const TEMP_DIR_PREFIX = "codarr_";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const pluginsDir = path.join(__dirname, "tree-elements", "plugins");
+const envPath = path.join(__dirname, "..", ".env");
 const remoteElementsDir = path.join(__dirname, "tree-elements", "remote");
-const logFile = process.env.CODARR_NODE_LOG_FILE ?? path.join(__dirname, "..", "logs", "node.log");
+const defaultLogDir = path.join(os.tmpdir(), "codarr");
+const logFile = process.env.CODARR_NODE_LOG_FILE ?? path.join(defaultLogDir, "node.log");
 
 initFileLogger(logFile);
+
+const LOG_LEVELS = { silent: 0, error: 1, warn: 2, info: 3, verbose: 4 };
+const currentLevel = LOG_LEVELS[String(process.env.CODARR_LOG_LEVEL ?? "info").toLowerCase()] ?? LOG_LEVELS.info;
+const originalConsole = {
+  log: console.log,
+  info: console.info,
+  warn: console.warn,
+  error: console.error,
+};
+console.log = (...args) => {
+  if (currentLevel >= LOG_LEVELS.info) originalConsole.log(...args);
+};
+console.info = (...args) => {
+  if (currentLevel >= LOG_LEVELS.info) originalConsole.info(...args);
+};
+console.warn = (...args) => {
+  if (currentLevel >= LOG_LEVELS.warn) originalConsole.warn(...args);
+};
+console.error = (...args) => {
+  if (currentLevel >= LOG_LEVELS.error) originalConsole.error(...args);
+};
+
+if (config.serverPublicKey && !config.nodePrivateKey) {
+  console.warn("[startup] Server public key configured but node private key is missing.");
+}
 const lastJobStart = new Map();
 const activeJobs = new Map();
 const activeCounts = {
@@ -24,6 +52,7 @@ const activeCounts = {
 let nodeSettings = {};
 let lastSettingsFetch = 0;
 let warnedPerfCounters = false;
+let pollInFlight = false;
 
 async function getMetrics() {
   return metricsMonitor.getLatest() ?? collectMetrics();
@@ -49,8 +78,23 @@ async function registerNode() {
       platform: detectPlatform(),
       metrics,
       hardware,
+      settings: {
+        healthcheckSlotsCpu: config.healthcheckSlotsCpu,
+        healthcheckSlotsGpu: config.healthcheckSlotsGpu,
+        transcodeSlotsCpu: config.transcodeSlotsCpu,
+        transcodeSlotsGpu: config.transcodeSlotsGpu,
+        targetHealthcheckCpu: config.targetHealthcheckCpu,
+        targetHealthcheckGpu: config.targetHealthcheckGpu,
+        targetTranscodeCpu: config.targetTranscodeCpu,
+        targetTranscodeGpu: config.targetTranscodeGpu,
+        healthcheckGpuTargets: config.healthcheckGpuTargets,
+        healthcheckGpuSlots: config.healthcheckGpuSlots,
+        transcodeGpuTargets: config.transcodeGpuTargets,
+        transcodeGpuSlots: config.transcodeGpuSlots,
+      },
       tags: config.nodeTags,
       jobs: Array.from(activeJobs.keys()),
+      publicKey: config.nodePublicKey || null,
     },
     { timeout: 30000 }
   );
@@ -142,16 +186,25 @@ async function heartbeat() {
 }
 
 async function pollJobs() {
+  if (pollInFlight) return;
+  pollInFlight = true;
   if (!config.enableJobs) return;
   const allowTranscode = config.enableTranscode;
-  await refreshNodeSettings();
-  const settings = nodeSettings ?? {};
-  const metrics = await getMetrics();
-  logResourceUsage("poll", metrics);
-  const cpuLoad = Number(metrics?.cpu?.load ?? 0);
-  const gpuMetrics = metrics?.gpus ?? [];
-  const gpuLoad = averageGpuUtil(gpuMetrics);
-  const now = Date.now();
+  try {
+    await refreshNodeSettings();
+    const settings = nodeSettings ?? {};
+    if (currentLevel >= LOG_LEVELS.verbose) {
+      originalConsole.log(
+        `[settings] healthcheck cpu=${settings.healthcheckSlotsCpu ?? config.healthcheckSlotsCpu} gpu=${settings.healthcheckSlotsGpu ?? config.healthcheckSlotsGpu} ` +
+          `transcode cpu=${settings.transcodeSlotsCpu ?? config.transcodeSlotsCpu} gpu=${settings.transcodeSlotsGpu ?? config.transcodeSlotsGpu}`
+      );
+    }
+    const metrics = await getMetrics();
+    logResourceUsage("poll", metrics);
+    const cpuLoad = Number(metrics?.cpu?.load ?? 0);
+    const gpuMetrics = metrics?.gpus ?? [];
+    const gpuLoad = averageGpuUtil(gpuMetrics);
+    const now = Date.now();
 
   const canStart = (key) => {
     const last = lastJobStart.get(key) ?? 0;
@@ -212,37 +265,49 @@ async function pollJobs() {
       })
     : 0;
 
-  const { data } = await httpClient.post(
-    `${config.serverUrl}/api/jobs/next`,
-    {
-      nodeId: config.nodeId,
-      slots: {
-        cpu: clampSlots(config.jobSlotsCpu, activeCpuTotal),
-        gpu: allowTranscode ? clampSlots(config.jobSlotsGpu, activeGpuTotal) : 0,
-        healthcheckCpu: healthcheckCpuSlots,
-        healthcheckGpu: healthcheckGpuSlots.count,
-        healthcheckGpuIndices: healthcheckGpuSlots.indices,
-        transcodeCpu: transcodeCpuSlots,
-        transcodeGpu: transcodeGpuSlots.count,
-        transcodeGpuIndices: transcodeGpuSlots.indices,
+    if (currentLevel >= LOG_LEVELS.verbose) {
+      originalConsole.log(
+        `[slots] cpuLoad=${cpuLoad.toFixed(1)} active=cpu:${activeCpuTotal} gpu:${activeGpuTotal} ` +
+          `healthcheck cpu=${healthcheckCpuSlots} gpu=${healthcheckGpuSlots.count} ` +
+          `transcode cpu=${transcodeCpuSlots} gpu=${transcodeGpuSlots.count} ` +
+          `healthcheckTargets gpu=${settings.healthcheckGpuTargets ?? config.healthcheckGpuTargets ?? "-"}`
+      );
+    }
+
+    const { data } = await httpClient.post(
+      `${config.serverUrl}/api/jobs/next`,
+      {
+        nodeId: config.nodeId,
+        slots: {
+          cpu: clampSlots(config.jobSlotsCpu, activeCpuTotal),
+          gpu: allowTranscode ? clampSlots(config.jobSlotsGpu, activeGpuTotal) : 0,
+          healthcheckCpu: healthcheckCpuSlots,
+          healthcheckGpu: healthcheckGpuSlots.count,
+          healthcheckGpuIndices: healthcheckGpuSlots.indices,
+          transcodeCpu: transcodeCpuSlots,
+          transcodeGpu: transcodeGpuSlots.count,
+          transcodeGpuIndices: transcodeGpuSlots.indices,
+        },
+        accelerators: allowTranscode ? detectAccelerators() : ["cpu"],
+        allowTranscode,
       },
-      accelerators: allowTranscode ? detectAccelerators() : ["cpu"],
-      allowTranscode,
-    },
-    { timeout: 30000 }
-  );
+      { timeout: 30000 }
+    );
 
-  const jobs = data.jobs ?? (data.job ? [data.job] : []);
-  if (!jobs.length) return;
+    const jobs = data.jobs ?? (data.job ? [data.job] : []);
+    if (!jobs.length) return;
 
-  for (const job of jobs) {
-    const processing = (job.processing_type ?? "cpu").toLowerCase();
-    const key = `${job.type}:${processing}`;
-    lastJobStart.set(key, Date.now());
-    trackJobStart(job);
-    processJob(job)
-      .catch((err) => logAxiosError("Job failed", err))
-      .finally(() => trackJobEnd(job.id));
+    for (const job of jobs) {
+      const processing = (job.processing_type ?? "cpu").toLowerCase();
+      const key = `${job.type}:${processing}`;
+      lastJobStart.set(key, Date.now());
+      trackJobStart(job);
+      processJob(job)
+        .catch((err) => logAxiosError("Job failed", err))
+        .finally(() => trackJobEnd(job.id));
+    }
+  } finally {
+    pollInFlight = false;
   }
 }
 
@@ -336,8 +401,62 @@ async function refreshNodeSettings() {
   try {
     const { data } = await httpClient.get(`${config.serverUrl}/api/nodes/${config.nodeId}/settings`, { timeout: 30000 });
     nodeSettings = data?.settings ?? {};
+    await persistNodeSettings(nodeSettings);
   } catch {
     nodeSettings = nodeSettings ?? {};
+  }
+}
+
+async function persistNodeSettings(settings) {
+  const syncEnabled = String(process.env.CODARR_NODE_SETTINGS_SYNC ?? "true").toLowerCase() !== "false";
+  if (!syncEnabled) return;
+  if (!settings || typeof settings !== "object") return;
+
+  const mapping = {
+    healthcheckSlotsCpu: "CODARR_HEALTHCHECK_SLOTS_CPU",
+    healthcheckSlotsGpu: "CODARR_HEALTHCHECK_SLOTS_GPU",
+    transcodeSlotsCpu: "CODARR_TRANSCODE_SLOTS_CPU",
+    transcodeSlotsGpu: "CODARR_TRANSCODE_SLOTS_GPU",
+    targetHealthcheckCpu: "CODARR_TARGET_HEALTHCHECK_CPU",
+    targetHealthcheckGpu: "CODARR_TARGET_HEALTHCHECK_GPU",
+    targetTranscodeCpu: "CODARR_TARGET_TRANSCODE_CPU",
+    targetTranscodeGpu: "CODARR_TARGET_TRANSCODE_GPU",
+    healthcheckGpuTargets: "CODARR_HEALTHCHECK_GPU_TARGETS",
+    healthcheckGpuSlots: "CODARR_HEALTHCHECK_GPU_SLOTS",
+    transcodeGpuTargets: "CODARR_TRANSCODE_GPU_TARGETS",
+    transcodeGpuSlots: "CODARR_TRANSCODE_GPU_SLOTS",
+  };
+
+  let content = "";
+  try {
+    content = await fs.readFile(envPath, "utf8");
+  } catch {
+    content = "";
+  }
+
+  let updated = content;
+  const setValue = (key, value) => {
+    const stringValue = value == null ? "" : String(value);
+    const line = `${key}=${stringValue}`;
+    const pattern = new RegExp(`^${key}=.*$`, "m");
+    if (pattern.test(updated)) {
+      updated = updated.replace(pattern, line);
+    } else {
+      const suffix = updated.endsWith("\n") || updated.length === 0 ? "" : "\n";
+      updated = `${updated}${suffix}${line}\n`;
+    }
+  };
+
+  Object.entries(mapping).forEach(([settingKey, envKey]) => {
+    if (settings[settingKey] === undefined) return;
+    setValue(envKey, settings[settingKey]);
+  });
+
+  if (updated !== content) {
+    await fs.writeFile(envPath, updated, "utf8");
+    if (currentLevel >= LOG_LEVELS.verbose) {
+      originalConsole.log("[settings] Node settings persisted to .env");
+    }
   }
 }
 
